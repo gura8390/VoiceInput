@@ -129,7 +129,7 @@ Copy-Item '.\assets\text\rules_default.txt' '.\dist\app\config\hot-rule.txt'
 
 ## 上一轮 CUDA 技术路线对照
 
-独立 [0.4.3—CUDA 技术分支](https://github.com/gura8390/YuYbUuRu/tree/0.4.3%E2%80%94CUDA) 保留上一轮研究。本节数据来自该轮，尚未启用 0.4.4 前端 arena。当前主线默认 `gpu_backend=vulkan`，按名字选择 `Vulkan0`。可显式选择 `cuda` / `CUDA0`，但需另外准备匹配 b9090 的 CUDA 插件、CUDA 12.8 运行库和 cuBLAS/Lt；缺少设备或后端明确报错。
+独立 [0.4.3—CUDA 技术分支](https://github.com/gura8390/YuYbUuRu/tree/0.4.3%E2%80%94CUDA) 已归档，参见 [CUDA 技术路线归档报告](docs/history/cuda-route-archive.md)。本节数据来自该轮，尚未启用 0.4.4 前端 arena。当前主线默认 `gpu_backend=vulkan`，按名字选择 `Vulkan0`。可显式选择 `cuda` / `CUDA0`，但需另外准备匹配 b9090 的 CUDA 插件、CUDA 12.8 运行库和 cuBLAS/Lt；缺少设备或后端明确报错。
 
 采用以下配置：
 
@@ -171,6 +171,8 @@ Windows Vulkan 持久管线缓存由配套 `ggml-vulkan.dll` 补丁提供；切�
 文件中间分段只返回轻量确认，完整累计结果保留在 worker。请求 JSON 上限 1 MiB，最终回复上限 64 MiB；超限明确报错。首次完整初始化 KV 缓存，后续成功调用仅重置状态；原生解码异常后，下次恢复完整清零。
 
 ## 测量与验证范围
+
+另见 [FireRedASR2-AED 本机对比测试](docs/history/fireredasr2-aed.md)，记录了与 Qwen3-ASR 1.7B 的冷启动、热态转写和资源占用。
 
 一组同机、相同 29 条输入、每版三轮的历史服务/推理进程树对照：最初 1.7B 原版到 0.4.0，热态私有提交约 5814.1 → 1271.2 MiB（下降 78.14%），工作集约 1493.6 → 177.1 MiB（下降 88.14%），响应中位约 273.5 → 150.8 ms（下降 44.85%）。
 
