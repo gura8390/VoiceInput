@@ -126,6 +126,20 @@ impl AudioEncoder {
                 };
             let parallel = !frontend && options.encoder_parallel_execution;
             let spinning = if options.encoder_spin_wait { "1" } else { "0" };
+            if std::env::var_os("YYUR_PROFILE_LOAD").is_some() {
+                eprintln!(
+                    "YYUR_ORT_POLICY {}",
+                    serde_json::json!({
+                        "model":path.file_name().map(|v|v.to_string_lossy()),
+                        "model_path":path,
+                        "graph_optimization":"3","prepacking":options.onnx_prepacking,
+                        "intra_threads":intra_threads,"inter_threads":options.onnx_inter_threads,
+                        "device_initializers":options.onnx_device_initializers,
+                        "memory_pattern":options.onnx_memory_pattern && !parallel,
+                        "cpu_arena":cpu_arena
+                    })
+                );
+            }
             let mut builder = Session::builder()?
                 .with_intra_threads(intra_threads)
                 .map_err(builder_error)?
@@ -201,9 +215,12 @@ impl AudioEncoder {
                 let prefix = directory.join(format!("{}-{id}-{model}", std::process::id()));
                 builder = builder.with_profiling(prefix).map_err(builder_error)?;
             }
-            let session = builder
-                .commit_from_file(path)
-                .with_context(|| format!("Load ONNX model {}", path.display()))?;
+            let session = builder.commit_from_file(path).with_context(|| {
+                format!(
+                    "加载编码器失败：{}。请完整保留 ONNX 模型及其配套的 .weights.bin 权重文件。",
+                    path.display()
+                )
+            })?;
             if profile_dir.is_some() {
                 // This is the requested EP; actual node assignment is in the
                 // profile. In particular, CPU shape nodes can be intentional.

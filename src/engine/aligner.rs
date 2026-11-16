@@ -60,7 +60,27 @@ impl Aligner {
         let dir = options
             .aligner_model_dir
             .clone()
-            .unwrap_or_else(|| app_dir.join("models/Qwen3-ForcedAligner/Qwen3-ForcedAligner-0.6B"));
+            .unwrap_or_else(|| crate::paths::AppPaths::new(app_dir).aligner_model());
+        for name in [
+            "qwen3_aligner_encoder_frontend.int4.onnx",
+            "qwen3_aligner_encoder_backend.int4.onnx",
+            "qwen3_aligner_llm.q4_k.gguf",
+        ] {
+            let file = dir.join(name);
+            let metadata = file
+                .metadata()
+                .with_context(|| format!("读取文件对齐模型失败：{}", file.display()))?;
+            ensure!(
+                metadata.is_file() && metadata.len() > 0,
+                "文件对齐模型为空或不是文件：{}",
+                file.display()
+            );
+        }
+        super::require_encoder_sidecars(
+            &dir,
+            "qwen3_aligner_encoder_frontend.int4.onnx",
+            "qwen3_aligner_encoder_backend.int4.onnx",
+        )?;
         // Retain the aligner's automatic ORT threading and CPU llama.
         // Allocator policy is independent of the ASR thread configuration.
         let mut align_options = options.clone();
@@ -79,6 +99,17 @@ impl Aligner {
             .map(usize::from)
             .unwrap_or(4) as i32;
         let threads = (logical / 2).max(1);
+        let batch_threads = logical;
+        if std::env::var_os("YYUR_PROFILE_LOAD").is_some() {
+            eprintln!(
+                "YYUR_ALIGNER_POLICY {}",
+                serde_json::json!({
+                    "ort_intra":align_options.onnx_intra_threads,
+                    "ort_inter":align_options.onnx_inter_threads,
+                    "native_threads":threads,"native_batch_threads":batch_threads
+                })
+            );
+        }
         // Keep CPU llama and its context on this thread while the independent
         // ORT encoder initializes. Join the encoder before propagating errors.
         let (encoder, model, embeddings, ctx) = std::thread::scope(|scope| -> Result<_> {
@@ -98,10 +129,9 @@ impl Aligner {
                 })?;
             let decoder = (|| -> Result<_> {
                 let stage = Instant::now();
-                let model = NativeModel::load(
+                let model = NativeModel::load_cpu_aligner(
                     &options.llama_dir(app_dir),
                     &dir.join("qwen3_aligner_llm.q4_k.gguf"),
-                    false,
                 )?;
                 super::load_timing("aligner.native_model", stage);
                 let stage = Instant::now();
@@ -124,7 +154,7 @@ impl Aligner {
                         options.aligner_n_ctx,
                         options.aligner_n_ctx,
                         threads,
-                        logical,
+                        batch_threads,
                         options.aligner_logits_limit,
                     )?)
                 };
@@ -162,7 +192,7 @@ impl Aligner {
                 1
             },
             threads,
-            batch_threads: logical,
+            batch_threads,
             last_metrics: AlignmentMetrics::default(),
             logits_limit: options.aligner_logits_limit,
             last_timestamp_positions: Vec::new(),

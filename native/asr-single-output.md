@@ -59,9 +59,9 @@ any source copy or version stamp; an identical exported patch is left untouched.
 The generated patch is also saved inside the selected artifact directory.
 
 ```powershell
-python tools/prepare_asr_single_output.py --base-source <accepted-limited-native-src> --output-dir <artifact-dir>
-powershell -NoProfile -ExecutionPolicy Bypass -File tools/build_asr_single_output.ps1 -NativeSource <artifact-dir>/native-src -BuildDir <build-dir> -SdkInclude <sdk-include-version-dir> -SdkLib <sdk-lib-version-dir> -SdkBin <sdk-bin-version-x64-dir> -VcVars <vcvars64.bat> -CMake <cmake.exe> -Ninja <ninja.exe> -Jobs 2
-python tools/verify_asr_single_output.py --candidate <build-dir>/bin/llama.dll --original-bin <original-runtime-native-bin> --output-dir <artifact-dir> --source-dir <artifact-dir>/native-src --dumpbin <dumpbin.exe>
+python tools/build/prepare_asr_single_output.py --base-source <accepted-limited-native-src> --output-dir <artifact-dir>
+powershell -NoProfile -ExecutionPolicy Bypass -File tools/build/build_asr_single_output.ps1 -NativeSource <artifact-dir>/native-src -BuildDir <build-dir> -SdkInclude <sdk-include-version-dir> -SdkLib <sdk-lib-version-dir> -SdkBin <sdk-bin-version-x64-dir> -VcVars <vcvars64.bat> -CMake <cmake.exe> -Ninja <ninja.exe> -Jobs 2
+python tools/validation/verify_asr_single_output.py --candidate <build-dir>/bin/llama.dll --original-bin <original-runtime-native-bin> --output-dir <artifact-dir> --source-dir <artifact-dir>/native-src --dumpbin <dumpbin.exe>
 ```
 
 The build script accepts MSVC, CMake, Ninja and Windows SDK locations explicitly.
@@ -94,7 +94,7 @@ Generic fixed-workload diagnostics:
 cargo build --release --example make_decoder_fixture --example decoder_replay_probe
 target/release/examples/make_decoder_fixture.exe --app-dir <vulkan-runtime> --embedding-f32 <encoder-output.f32> --tokens-json <accepted-vulkan-token-array.json> --output-dir <new-fixture-dir>
 target/release/examples/decoder_replay_probe.exe --app-dir <candidate-runtime> --backend cuda --prefill-f32 <fixture-dir>/prefill.f32 --tokens-json <fixture-dir>/tokens.json --n-ctx 4096 --repeats 5 --output <new-report.json>
-python tools/cuda_blas_smoke.py --native-bin <delay-cublas-runtime-bin> --output <new-smoke-report.json>
+python tools/validation/cuda_blas_smoke.py --native-bin <delay-cublas-runtime-bin> --output <new-smoke-report.json>
 ```
 
 The fixture builder uses CPU-only native model loading for original tokenization

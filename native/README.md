@@ -2,6 +2,8 @@
 
 0.4.4 在以下 0.4.3 补丁之上采用 [ASR 单输出预留](asr-single-output.md)，默认选择 Vulkan。可选 CUDA 技术路线另有 [cuBLAS 延迟加载](cuda-delayload.md)，主线运行包不需要 CUDA vendor DLL。原始普通初始化接口兼容性不代表应用默认配置兼容旧 DLL；当前默认单输出和 4000 列对齐都要求对应扩展。
 
+进一步的模型加载优化见 [Windows Vulkan 有界模型上传](windows-vulkan-bounded-upload.md)：GPU 权重使用原有小缓冲环上传，CPU 嵌入表继续零拷贝映射，不改变模型计算。
+
 `aligner-logits.patch` 针对官方 [llama.cpp](https://github.com/ggml-org/llama.cpp) 的 **b9090**，提交 **`5757c4dcb178a01c85234a6db7503b19c9598873`**。它为只读、CPU Qwen3VL 文件对齐增加两个导出函数：`caps_llama_init_from_model_with_logits_limit` 和 `caps_llama_logits_width`。普通初始化入口继续输出完整词表；GPU 路线由应用配置显式选择。
 
 `ggml-vulkan-cache.patch` 使用同一提交，为 Windows Vulkan 后端添加持久管线缓存及缓存失效后的无缓存重试，并将构建期 shader 编译器内部并发上限设为 2。补丁本身已经包含新增 `ggml-vulkan-cache.hpp`；仓库内的同名头文件用于独立审阅，不必再次手动复制。
@@ -75,7 +77,7 @@ Get-FileHash (Join-Path $taskVulkanBuild 'bin/ggml-vulkan.dll') -Algorithm SHA25
 
 `--parallel 2` 限制 CMake 外层构建进程并发；补丁将构建期 `vulkan-shaders-gen` 内部调用 `glslc` 的并发上限设为 2，属于不同的控制项。运行时 Vk 管线创建线程池仍使用原有 `hardware_concurrency`，此补丁没有改变它。SDK、`glslc` 与编译器版本会影响生成的 shader 和 DLL 字节，不能用源码一致直接代替实际推理验证。
 
-停止本应用及其 worker、保存原文件后，仅将生成的 `llama.dll` 和 `ggml-vulkan.dll` 放入运行目录的 `core/server/engines/llama/bin/`。保留匹配 b9090 的原 `ggml.dll`、`ggml-base.dll`、CPU 后端、OpenMP 及其它依赖 DLL；不要把此次构建的其余 ggml DLL 一并覆盖，也不要混用不同提交的后端。本源码仓库不附带这些二进制。
+停止本应用及其 worker、保存原文件后，仅将生成的 `llama.dll` 和 `ggml-vulkan.dll` 放入运行目录的 `runtime/llama/`。保留匹配 b9090 的原 `ggml.dll`、`ggml-base.dll`、CPU 后端、OpenMP 及其它依赖 DLL；不要把此次构建的其余 ggml DLL 一并覆盖，也不要混用不同提交的后端。本源码仓库不附带这些二进制。
 
 ## 缓存行为
 

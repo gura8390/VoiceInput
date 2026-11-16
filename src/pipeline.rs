@@ -91,6 +91,9 @@ impl Pipeline {
         Ok(())
     }
     pub fn dispatch(&mut self, request: Request, pcm: &[f32]) -> Reply {
+        // The aligner's idle deadline is independent of active dictation jobs.
+        // A busy input queue must not keep an otherwise unused model alive.
+        self.cleanup_idle();
         let id = request.id();
         match &request {
             Request::Warmup { .. } | Request::Segment { .. } => {
@@ -181,7 +184,19 @@ impl Pipeline {
                     self.aligner = Some(Aligner::load(&self.settings.app_dir, &self.options)?);
                 }
                 let aligner = self.aligner.as_mut().unwrap();
+                let alignment_started = Instant::now();
                 let aligned = aligner.align(pcm, &raw.text, &language, 0.0);
+                if aligned.is_ok() && std::env::var_os("YYUR_ALIGNER_TIMING").is_some() {
+                    let record = format!(
+                        "YYUR_ALIGNER_TIMING {}\n",
+                        serde_json::json!({
+                            "elapsed_seconds":alignment_started.elapsed().as_secs_f64(),
+                            "metrics":aligner.last_metrics()
+                        })
+                    );
+                    let _ =
+                        std::io::Write::write_all(&mut std::io::stderr().lock(), record.as_bytes());
+                }
                 if handoff {
                     aligner.release_context();
                 }

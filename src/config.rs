@@ -61,6 +61,8 @@ pub enum EncoderProvider {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Settings {
+    /// Relative paths are resolved from the configuration file's directory.
+    /// The packaged config/settings.json therefore uses ".." for the app root.
     pub app_dir: PathBuf,
     pub asr_model: AsrModel,
     pub onnx_dll: Option<PathBuf>,

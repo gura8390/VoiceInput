@@ -1,10 +1,20 @@
 # 语音输入 · YuYbUuRu
 
-Windows x64 离线语音输入工具，当前版本 **0.4.5**。默认使用 Qwen3-ASR-0.6B 量化模型，可选原版 Qwen3-ASR-1.7B。沿用 Vulkan 解码、CPU 编码器、ASR 单输出预留和固定形状前端缓冲复用。应用层使用 Rust，日常运行无需 Python；推理使用 ONNX Runtime 和 llama.cpp 原生库。
+Windows x64 离线语音输入工具，当前版本 **0.6.0**。启动文件统一为 **语音输入.exe**，应用图标与中文产品信息嵌入程序。正式安装和示例配置默认使用 Qwen3-ASR-1.7B，0.6B 可选。沿用 Vulkan 解码、CPU 编码器、ASR 单输出预留和固定形状前端缓冲复用。应用层使用 Rust，日常运行无需 Python；推理使用 ONNX Runtime 和 llama.cpp 原生库。
 
 保留三个功能：实时听写、热词替换、音视频文件转录。长按 CapsLock 或鼠标 X2 超过 0.3 秒开始听写，松开后输入；短按补发原键。托盘提供热词编辑、文件转录及退出。文件输出 TXT、JSON、SRT，默认保留已有同名输出。
 
 本项目参考并移植了 [CapsWriter-Offline](https://github.com/HaujetZhao/CapsWriter-Offline) 的应用行为、热词、格式化、合并和字幕算法，保留原作者 **Haujet Zhao** 的 MIT 版权及第三方声明。这是独立的 Rust 重构仓库，不是上游的 GitHub Fork。
+
+## 0.6.0
+
+本版汇总单一启动入口、目录整理、AI 自动化接口与持续内存优化。此前测量使用内部版本号 1.0.0／1.0.1，现统一以 **0.6.0** 对外发布；历史数字仍绑定当时构建的 SHA，识别算法和模型精度保持。
+
+托盘操作保持实时听写、转录文件、编辑热词和退出。程序按显示器 DPI 绘制，图标和中文产品信息嵌入 EXE。启动目录只使用一个“语音输入.exe”。
+
+面向自动化的状态查询、文本修正、配置及登录启动操作见 [AI 操作说明](docs/ai-automation.md)。通过命令返回结构化结果，现有文件转录命令继续可用。
+
+本轮采用 ONNX 外置权重，保留已有权重数值和计算图；按实际输入分配解码上下文，并让闲置清理覆盖连续请求场景。模型和当前配置的完整结果见 [持续内存优化报告](docs/memory-optimization.md)，历次测量见 [优化历史](docs/optimization-history.md)。
 
 ## 构建
 
@@ -15,64 +25,73 @@ Windows x64 离线语音输入工具，当前版本 **0.4.5**。默认使用 Qwe
 .\build.ps1
 .\build.ps1 -Tests
 
-# 缺少 SDK 导入库时可先执行；仅下载到本项目 .build，不改全局环境
-python .\tools\bootstrap_sdk.py
+# 缺少 SDK 导入库时可先执行；下载到共享构建环境，不改全局环境
+python .\tools\build\bootstrap_sdk.py
 ```
 
-产物为 `target\release\yuybuuru.exe`。Python 3.11+ 仅用于可选的 SDK 准备或字典再生成，不参与语音推理。
+正式启动文件为 `dist\语音输入.exe`。Cargo 中间产物保留在 `target` 构建目录。Python 3.11+ 仅用于 SDK、模型准备或字典再生成等开发工具，不参与日常语音推理。
+
+构建优先使用已安装的 Windows SDK。共享后备构建目录可通过进程环境变量 `YYUR_SHARED_BUILD_DIR` 指定，其中 `windows-sdk-x64` 保存导入库，`windows-sdk-cpp` 保存资源编译器等工具；工作区布局的默认位置由源码目录相对推导。也可分别设置 `YYUR_SDK_LIB_DIR` 和 `YYUR_SDK_CPP_DIR`，显式 `RC` 仍优先。构建不依赖旧项目目录。开发脚本的分类、用途及验证入口见 [工具目录说明](tools/README.md)。
 
 ## 运行目录
 
 仓库只发布源码、通用词典、许可证和合成测试数据，模型、原生 DLL 和 FFmpeg 需另外准备。可复用合法取得的兼容 CapsWriter 运行库，保留它们的许可与依赖文件；不要随意混用不同 llama ABI 的 DLL。
 
 ```text
-runtime/
-  start_client.exe                 # 将构建产物复制为此名称
-  settings.json                   # 从 settings.example.json 复制
-  hot.txt                         # 个人热词；仓库示例不含个人资料
-  hot-rule.txt                    # 可选的替换规则
-  ffmpeg.exe                      # 连同其所需 DLL
-  core/server/engines/llama/bin/   # 兼容的 llama、ggml、CPU/Vulkan、libomp DLL
-  internal/onnxruntime/capi/       # onnxruntime.dll 与配套依赖
-  internal/_sounddevice_data/portaudio-binaries/libportaudio64bit.dll
-  models/Qwen3-ASR/Qwen3-ASR-0.6B/
+语音输入/
+  语音输入.exe                     # 唯一程序入口，包含图标
+  必需的启动 DLL                   # EXE 直接导入的 CRT/MSVC 库
+  config/
+    settings.json                 # 从 settings.example.json 复制
+    hot.txt                       # 个人热词；仓库示例不含个人资料
+    hot-rule.txt                  # 可选的替换规则
+  runtime/
+    llama/                        # 匹配的 llama、ggml、CPU/Vulkan、libomp DLL
+    onnx/                         # onnxruntime.dll 与配套依赖
+    audio/libportaudio64bit.dll
+    media/ffmpeg.exe               # 连同其所需 DLL
+  models/Qwen3-ASR/Qwen3-ASR-0.6B/  # 可选小模型
+  models/Qwen3-ASR/Qwen3-ASR-1.7B/  # 当前默认模型
   models/Qwen3-ForcedAligner/Qwen3-ForcedAligner-0.6B/
+  logs/
+  cache/
+  docs/
 ```
 
-ASR 目录包含 `qwen3_asr_encoder_frontend.int4.onnx`、`qwen3_asr_encoder_backend.int4.onnx`、`qwen3_asr_llm.q4_k.gguf`。对齐目录使用对应的 `qwen3_aligner_encoder_frontend.int4.onnx`、`qwen3_aligner_encoder_backend.int4.onnx`、`qwen3_aligner_llm.q4_k.gguf`；模型目录中的其它外部权重文件也须完整保留。
+0.6B ASR 目录包含 `qwen3_asr_encoder_frontend.int4.onnx`、`qwen3_asr_encoder_backend.int4.onnx`、`qwen3_asr_llm.q4_k.gguf`。对齐目录使用对应的 `qwen3_aligner_encoder_frontend.int4.onnx`、`qwen3_aligner_encoder_backend.int4.onnx`、`qwen3_aligner_llm.q4_k.gguf`。当前模型包的每个 ONNX 都有同前缀 `.weights.bin`，两者必须一同保留；加载前会检查配套文件。准备方法见 [模型工具说明](tools/README.md#模型准备)。
 
 ```powershell
-New-Item -ItemType Directory -Path '.\runtime' -Force
-Copy-Item '.\target\release\yuybuuru.exe' '.\runtime\start_client.exe'
-Copy-Item '.\settings.example.json' '.\runtime\settings.json'
-Copy-Item '.\assets\text\hot_default.txt' '.\runtime\hot.txt'
-Copy-Item '.\assets\text\rules_default.txt' '.\runtime\hot-rule.txt'
+New-Item -ItemType Directory -Path '.\dist\app\config' -Force
+Copy-Item '.\dist\语音输入.exe' '.\dist\app\语音输入.exe'
+Copy-Item '.\settings.example.json' '.\dist\app\config\settings.json'
+Copy-Item '.\assets\text\hot_default.txt' '.\dist\app\config\hot.txt'
+Copy-Item '.\assets\text\rules_default.txt' '.\dist\app\config\hot-rule.txt'
 # 将上述原生运行库、FFmpeg 与模型准备完整后启动
-.\runtime\start_client.exe
-.\runtime\start_client.exe transcribe '.\sample.wav' --output-dir '.\output'
+.\dist\app\语音输入.exe
+.\dist\app\语音输入.exe transcribe '.\sample.wav' --output-dir '.\output'
 # 明确需要覆盖已有输出时增加 --overwrite
 ```
 
-也可用 `--app-dir` 指定运行目录、`--config` 指定设置文件。示例配置的 ASR 编码器线程为 8/1，Vulkan 解码器线程为 1/1；文件对齐器沿用独立 CPU 配置。低层诊断接口保留原 16 线程默认值。
+也可用 `--app-dir` 指定运行目录、`--config` 指定设置文件。默认配置路径为 EXE 旁的 `config/settings.json`。配置中相对 `app_dir` 以配置文件父目录为基准，因此示例值为 `..`，指回程序根目录。新版本只读取新目录；旧版迁移应先备份并实际移动文件，不建立旧路径兼容入口。组织与迁移说明见 [目录说明](docs/layout.md)。示例配置的 ASR 编码器线程为 8/1，Vulkan 解码器线程为 1/1；文件对齐器沿用独立 CPU 配置。低层诊断接口保留原 16 线程默认值。
 
 ## 可选 ASR 模型
 
-0.4.5 增加 `asr_model` 设置，取值为 `0.6b` 或 `1.7b`；旧配置缺少该项时仍使用 `0.6b`。请在现有 `settings.json` 中修改这一项，保留其它设置。也可用全局启动参数覆盖本次选择，不会写回配置：
+0.4.5 增加 `asr_model` 设置，取值为 `0.6b` 或 `1.7b`；低层缺省设置为 `0.6b`。请在现有 `config/settings.json` 中修改这一项，保留其它设置。正式安装和当前模板都明确选择 `1.7b`。也可用全局启动参数覆盖本次选择，不会写回配置：
 
 ```powershell
-.\runtime\start_client.exe --asr-model 1.7b
-.\runtime\start_client.exe --asr-model 0.6b
-.\runtime\start_client.exe --asr-model 1.7b transcribe '.\sample.wav' --output-dir '.\output'
+.\dist\app\语音输入.exe --asr-model 1.7b
+.\dist\app\语音输入.exe --asr-model 0.6b
+.\dist\app\语音输入.exe --asr-model 1.7b transcribe '.\sample.wav' --output-dir '.\output'
 ```
 
-切换桌面听写模型前，先从托盘退出当前实例，再重新启动。同目录重复启动只会触发单实例保护，不会在线切换模型。本机运行目录另提供两个模型快捷方式；两者共用现有热词和其它设置。直接运行原入口仍按 `settings.json` 选择，默认保持小模型。
+切换桌面听写模型前，先从托盘退出当前实例，再重新启动。同目录重复启动只会触发单实例保护，不会在线切换模型。模型快捷方式均指向同一个 `语音输入.exe`，共用热词和其它设置。直接运行按 `settings.json` 选择。迁移旧版时，将登录启动和桌面快捷方式统一指向 `语音输入.exe`，删除旧双入口，登录启动只注册一次。
 
 | 选择 | ASR 目录 | 编码器 | 解码器 |
 |---|---|---|---|
 | `0.6b` | `models/Qwen3-ASR/Qwen3-ASR-0.6B` | 原 INT4 ONNX | 原 Q4_K GGUF |
 | `1.7b` | `models/Qwen3-ASR/Qwen3-ASR-1.7B` | 旧版 FP16 ONNX | 旧版 Q5_K_M GGUF |
 
-1.7B 使用原文件名 `qwen3_asr_encoder_frontend.onnx`、`qwen3_asr_encoder_backend.onnx`、`qwen3_asr_llm.gguf`，三文件合计 2,107,141,427 字节；这不是当前作者另发的 INT4/Q4_K 包。磁盘大小不代表运行内存，参数量与量化规格也不能混为单一影响因素。模型缺失会明确报错，不会静默切回小模型。文件对齐器仍使用原 0.6B，对齐、热词、格式化及空闲卸载策略保持原样。
+1.7B 使用原文件名 `qwen3_asr_encoder_frontend.onnx`、`qwen3_asr_encoder_backend.onnx`、`qwen3_asr_llm.gguf`，外置后另带两个 `.weights.bin`。编码权重仍为原 FP16，解码仍为原 Q5_K_M；这不是另行量化的小包。磁盘大小不代表运行内存，参数量与量化规格也不能混为单一影响因素。模型缺失会明确报错。文件对齐器仍使用原 0.6B 权重，热词和格式化保留，卸载期限仍为 ASR 120 秒、对齐器 10 秒。
 
 两套模型可能产生不同识别结果；固定输出差异不能当作 WER 或识别率结论。仓库不分发模型、私人录音、运行库或本机测量文件。
 
@@ -92,11 +111,10 @@ Copy-Item '.\assets\text\rules_default.txt' '.\runtime\hot-rule.txt'
 
 `encoder_frontend_arena=true` 只让固定 `[1,128,100]` 前端复用 ONNX Runtime CPU 缓冲。后端仍关闭 arena，避免长音频分配保留；对齐器也保留独立的 arena-off 设置。模型文件、int4 权重、FP32 激活、F16 KV、采样与音频切分均保持原样。示例配置启用此项，旧配置缺字段时仍为 `false`。
 
-本轮先拆分 Mel、前端打包/推理/收集、后端准备/推理、输出复制的累计耗时，再用相同 39 条输入做交错对照。诊断用 `YYUR_ENCODER_TIMING` 默认关闭；`examples/encoder_probe.rs` 与 `tools/bench_encoder.py` 比较完整浮点编码输出的 SHA，完整服务回归另检查文本、token、时间戳及原始字段。
+本轮先拆分 Mel、前端打包/推理/收集、后端准备/推理、输出复制的累计耗时，再用相同 39 条输入做交错对照。诊断用 `YYUR_ENCODER_TIMING` 默认关闭；`examples/encoder_probe.rs` 与 `tools/research/bench_encoder.py` 比较完整浮点编码输出的 SHA，完整服务回归另检查文本、token、时间戳及原始字段。
 
 线程数、Run 内自旋、动态任务分块、后端 arena/收缩、后端分支并行、前端批处理和自有进程 HighQoS 都经过筛选。只采用前端固定形状 arena；其余未纳入示例配置。产品不设置 HighQoS、CPU 亲和性、进程优先级或系统电源计划。研究工具可复现这些对照，但不参与日常运行。
 
-新版本需要带单输出扩展的 `llama.dll`，见 [原生补丁说明](native/asr-single-output.md)。两个入口 `start_client.exe` / `start_server.exe` 若同时保留，应更新为同一构建；本仓库不附模型或运行 DLL。
 
 同机相同 39 条输入、各三轮交错，使用最终 0.4.4 同一二进制，关闭诊断计时后得到：
 
@@ -138,7 +156,7 @@ CUDA 相对自身未优化基线的私有提交峰值减少 **26.21%**；这不�
 
 ## 热词与资源管理
 
-`hot.txt` 每行一个目标词，使用 `|` 添加发音别名，例如 `Codex|扣德克斯`。热词和规则在文件修改后重新加载。仓库内置的默认示例均为通用词语。
+`config/hot.txt` 每行一个目标词，使用 `|` 添加发音别名，例如 `Codex|扣德克斯`。`config/hot-rule.txt` 保存替换规则。热词和规则在文件修改后重新加载。仓库内置的默认示例均为通用词语。
 
 模型闲置 120 秒后退出整个推理进程，下次请求时重建；文件对齐器闲置 10 秒释放。采集音频队列有 1 MiB 分配预算，超额或明确丢帧时废弃整句，避免缺帧文本被当作成功输出。文件使用一个工作线程，最多排队四条路径。
 

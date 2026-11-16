@@ -4,6 +4,8 @@ use anyhow::{Context, Result, ensure};
 use clap::Parser;
 use serde_json::json;
 use sha2::{Digest, Sha256};
+#[cfg(test)]
+use yuybuuru::paths;
 use std::{
     fs::{self, File, OpenOptions},
     io::{Read, Write},
@@ -116,7 +118,7 @@ fn main() -> Result<()> {
     // CPU-only weight loading supplies tokenization and the original GGML
     // dequantizer. No NativeContext, encoder, sampler or decode is constructed.
     let model = NativeModel::load_with_backend(
-        &app.join("core/server/engines/llama/bin"),
+        &yuybuuru::paths::AppPaths::new(&app).llama(),
         &weights,
         false,
         GpuBackend::Vulkan,

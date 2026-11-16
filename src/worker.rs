@@ -96,12 +96,7 @@ impl Connection {
     fn spawn(settings: &Settings, closing: Arc<AtomicBool>) -> Result<Self> {
         let log_dir = std::env::var_os("YYUR_LOG_DIR")
             .map(std::path::PathBuf::from)
-            .unwrap_or(
-                std::env::current_exe()?
-                    .parent()
-                    .context("Executable folder")?
-                    .join("logs"),
-            );
+            .unwrap_or(crate::paths::AppPaths::new(&settings.app_dir).logs());
         std::fs::create_dir_all(&log_dir)?;
         let log_path = log_dir.join("rust-worker.log");
         if log_path
@@ -128,7 +123,7 @@ impl Connection {
         {
             command.env(
                 "GGML_VK_PIPELINE_CACHE_DIR",
-                settings.app_dir.join("cache/vulkan"),
+                crate::paths::AppPaths::new(&settings.app_dir).vulkan_cache(),
             );
         } else {
             command.env_remove("GGML_VK_PIPELINE_CACHE_DIR");
@@ -151,7 +146,7 @@ impl Connection {
             dll_dirs.push(absolute.parent().context("ONNX DLL directory")?.to_owned());
         }
         if settings.gpu_backend == crate::config::GpuBackend::Cuda {
-            dll_dirs.push(settings.app_dir.join("core/server/engines/llama/bin"));
+            dll_dirs.push(crate::paths::AppPaths::new(&settings.app_dir).llama());
         }
         if !dll_dirs.is_empty() {
             let inherited = std::env::var_os("PATH").unwrap_or_default();
@@ -304,8 +299,11 @@ impl WorkerService {
                         match result {
                             Ok(reply)
                                 if reply.kind == "load_error"
-                                    && matches!(request, Request::Segment { .. }) =>
+                                    && matches!(&request, Request::Segment { source, .. } if source != "file") =>
                             {
+                                // Live dictation retains PCM for recovery. A
+                                // file remains on disk, so return its load
+                                // error immediately instead of retrying forever.
                                 eprintln!(
                                     "Model load failed; retain PCM and retry in {retry}s: {}",
                                     reply.error.as_deref().unwrap_or("unknown")

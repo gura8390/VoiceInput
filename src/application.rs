@@ -79,8 +79,8 @@ impl TextProcessor {
     }
     fn refresh(&mut self) -> Result<()> {
         let paths = [
-            self.settings.app_dir.join("hot.txt"),
-            self.settings.app_dir.join("hot-rule.txt"),
+            crate::paths::AppPaths::new(&self.settings.app_dir).hotwords(),
+            crate::paths::AppPaths::new(&self.settings.app_dir).hotword_rules(),
         ];
         let signature = paths
             .iter()

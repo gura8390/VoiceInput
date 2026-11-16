@@ -28,11 +28,28 @@ use std::{
 /// Opt-in diagnostics use stderr so the binary protocol remains unchanged.
 pub(super) fn load_timing(stage: &'static str, started: Instant) {
     if std::env::var_os("YYUR_PROFILE_LOAD").is_some() {
-        eprintln!(
-            "YYUR_LOAD_PROFILE {{\"stage\":\"{stage}\",\"seconds\":{},\"pid\":{}}}",
-            started.elapsed().as_secs_f64(),
-            std::process::id()
+        let mut memory =
+            windows_sys::Win32::System::ProcessStatus::PROCESS_MEMORY_COUNTERS_EX::default();
+        memory.cb = std::mem::size_of_val(&memory) as u32;
+        let memory_ok = unsafe {
+            windows_sys::Win32::System::ProcessStatus::GetProcessMemoryInfo(
+                windows_sys::Win32::System::Threading::GetCurrentProcess(),
+                (&mut memory
+                    as *mut windows_sys::Win32::System::ProcessStatus::PROCESS_MEMORY_COUNTERS_EX)
+                    .cast(),
+                std::mem::size_of_val(&memory) as u32,
+            ) != 0
+        };
+        let line = format!(
+            "YYUR_LOAD_PROFILE {}\n",
+            serde_json::json!({"stage":stage,"seconds":started.elapsed().as_secs_f64(),
+                "pid":std::process::id(),
+                "end_unix_seconds":SystemTime::now().duration_since(UNIX_EPOCH).map(|v|v.as_secs_f64()).unwrap_or_default(),
+                "memory_valid":memory_ok,"working_set_bytes":memory.WorkingSetSize,
+                "peak_working_set_bytes":memory.PeakWorkingSetSize,"private_bytes":memory.PrivateUsage})
         );
+        // Emit one complete record so concurrent native stderr does not split JSON.
+        let _ = std::io::Write::write_all(&mut std::io::stderr().lock(), line.as_bytes());
     }
 }
 
@@ -123,13 +140,13 @@ impl EngineOptions {
     fn llama_dir(&self, app: &Path) -> PathBuf {
         self.llama_dir
             .clone()
-            .unwrap_or_else(|| app.join("core/server/engines/llama/bin"))
+            .unwrap_or_else(|| crate::paths::AppPaths::new(app).llama())
     }
     fn onnx_dll(&self, app: &Path) -> PathBuf {
         match self.onnx_dll.as_ref() {
             Some(path) if path.is_absolute() => path.clone(),
             Some(path) => app.join(path),
-            None => app.join("internal/onnxruntime/capi/onnxruntime.dll"),
+            None => crate::paths::AppPaths::new(app).onnx(),
         }
     }
 }
@@ -163,6 +180,26 @@ pub struct Engine {
     next_seeds: VecDeque<u32>,
 }
 
+fn require_encoder_sidecars(dir: &Path, frontend: &str, backend: &str) -> Result<()> {
+    // Validate the prepared model pack before starting either loader. An ORT
+    // failure must not leave an unrelated native GPU upload running first.
+    for name in [frontend, backend] {
+        let weights = dir.join(name).with_extension("weights.bin");
+        let metadata = weights.metadata().with_context(|| {
+            format!(
+                "读取编码器权重文件失败：{}。请完整保留模型包中的 ONNX 和配套 .weights.bin 文件。",
+                weights.display()
+            )
+        })?;
+        ensure!(
+            metadata.is_file() && metadata.len() > 0,
+            "编码器权重文件为空或不是文件：{}。请重新准备完整模型包。",
+            weights.display()
+        );
+    }
+    Ok(())
+}
+
 impl Engine {
     pub fn load(app_dir: &Path, options: &EngineOptions) -> Result<Self> {
         let load_started = Instant::now();
@@ -177,6 +214,7 @@ impl Engine {
                 file.display()
             );
         }
+        require_encoder_sidecars(&dir, spec.frontend, spec.backend)?;
         // The encoder and decoder own independent runtimes and immutable model
         // inputs. Overlap their initialization without changing inference order.
         // Always join the encoder, including when decoder initialization fails.
@@ -206,12 +244,14 @@ impl Engine {
                 load_timing("asr.native_model", stage);
                 let stage = Instant::now();
                 let embeddings = EmbeddingTable::open(&dir.join(spec.decoder), model.api.clone())?;
+                load_timing("asr.embeddings", stage);
                 ensure!(
                     embeddings.dim == model.dim,
                     "Embedding dimension differs from native model"
                 );
                 // Dynamic mode waits for the prompt length; otherwise an
                 // initial full context would inflate the first-request peak.
+                let context_stage = Instant::now();
                 let ctx = if options.asr_dynamic_context {
                     None
                 } else {
@@ -224,6 +264,7 @@ impl Engine {
                         options.asr_single_output,
                     )?)
                 };
+                load_timing("asr.context", context_stage);
                 load_timing("asr.embeddings_and_context", stage);
                 Ok((model, embeddings, ctx))
             })();

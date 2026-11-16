@@ -72,7 +72,9 @@ fn main() -> Result<()> {
         "Refusing to overwrite an existing report"
     );
     let app = args.app_dir.canonicalize()?;
-    let config = args.config.unwrap_or_else(|| app.join("settings.json"));
+    let config = args
+        .config
+        .unwrap_or_else(|| yuybuuru::paths::AppPaths::new(&app).settings());
     let settings = yuybuuru::config::Settings::load(Some(&config), Some(&app))?;
     ensure!(
         settings.encoder_provider == EncoderProvider::Cpu,
@@ -82,7 +84,7 @@ fn main() -> Result<()> {
     let dll = match &options.onnx_dll {
         Some(p) if p.is_absolute() => p.clone(),
         Some(p) => app.join(p),
-        None => app.join("internal/onnxruntime/capi/onnxruntime.dll"),
+        None => yuybuuru::paths::AppPaths::new(&app).onnx(),
     };
     let spec = options.asr_model.spec();
     let model = options.asr_model_directory(&app);
@@ -111,6 +113,20 @@ fn main() -> Result<()> {
     let ort_hash = hash_file(&dll)?;
     let frontend_hash = hash_file(&model.join(spec.frontend))?;
     let backend_hash = hash_file(&model.join(spec.backend))?;
+    let mut external_weights = std::collections::BTreeMap::new();
+    for name in [spec.frontend, spec.backend] {
+        let sidecar = model.join(name).with_extension("weights.bin");
+        if sidecar.try_exists()? {
+            external_weights.insert(
+                sidecar
+                    .file_name()
+                    .context("External weight filename")?
+                    .to_string_lossy()
+                    .into_owned(),
+                hash_file(&sidecar)?,
+            );
+        }
+    }
     let manifest_hash = hash_file(&args.manifest)?;
     let tick = Instant::now();
     let mut encoder =
@@ -179,6 +195,7 @@ fn main() -> Result<()> {
         "selected_model":options.asr_model,"model_files":spec,
         "settings":settings,"settings_sha256":settings_hash,"ort_sha256":ort_hash,
         "frontend_sha256":frontend_hash,"backend_sha256":backend_hash,
+        "external_weights_sha256":external_weights,
         "manifest_sha256":manifest_hash,"load_and_warmup_seconds":load_seconds,
         "load_warmup_metrics":warmup_metrics,"samples":rows,"no_decoder_or_sampling":true});
     if let Some(parent) = args.output.parent() {

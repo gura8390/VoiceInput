@@ -1,9 +1,11 @@
 pub mod application;
+pub mod automation;
 pub mod capture;
 pub mod config;
 pub mod desktop;
 pub mod engine;
 pub mod media;
+pub mod paths;
 pub mod pipeline;
 pub mod process_guard;
 pub mod protocol;

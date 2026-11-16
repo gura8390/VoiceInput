@@ -89,14 +89,43 @@ fn tip(value: &str) -> [u16; 128] {
     output
 }
 
+struct ApplicationIcons {
+    large: HICON,
+    small: HICON,
+}
+
+impl ApplicationIcons {
+    unsafe fn load(instance: HINSTANCE) -> Result<Self> {
+        let large = LoadImageW(
+            instance,
+            1usize as *const u16,
+            IMAGE_ICON,
+            GetSystemMetrics(SM_CXICON),
+            GetSystemMetrics(SM_CYICON),
+            LR_SHARED,
+        ) as HICON;
+        let small = LoadImageW(
+            instance,
+            1usize as *const u16,
+            IMAGE_ICON,
+            GetSystemMetrics(SM_CXSMICON),
+            GetSystemMetrics(SM_CYSMICON),
+            LR_SHARED,
+        ) as HICON;
+        if !large.is_null() && !small.is_null() {
+            return Ok(Self { large, small });
+        }
+        bail!("无法加载语音输入图标：{}", std::io::Error::last_os_error());
+    }
+}
+
 struct Context {
     options: DesktopOptions,
     events: BudgetEventSender,
     capture: Capture,
     holds: RefCell<HoldTracker>,
     hwnd: Cell<HWND>,
-    icon: HICON,
-    own_icon: bool,
+    icons: ApplicationIcons,
     status: RefCell<String>,
     taskbar_created: u32,
     added: Cell<bool>,
@@ -114,7 +143,7 @@ impl Context {
         data.uID = 1;
         data.uFlags = NIF_MESSAGE | NIF_ICON | NIF_TIP | NIF_SHOWTIP;
         data.uCallbackMessage = WM_TRAY;
-        data.hIcon = self.icon;
+        data.hIcon = self.icons.small;
         data.szTip = tip(&format!("语音输入 · {}", self.status.borrow()));
         data
     }
@@ -225,9 +254,10 @@ impl Context {
     }
 
     unsafe fn edit_hotwords(&self) {
-        let file = self.options.base_dir.join("hot.txt");
+        let file = crate::paths::AppPaths::new(&self.options.base_dir).hotwords();
         if !file.exists() {
-            if let Err(error) = std::fs::write(&file, b"") {
+            if let Err(error) = std::fs::create_dir_all(file.parent().expect("Hotword directory"))
+                .and_then(|_| std::fs::write(&file, b"")) {
                 self.set_status(error.to_string());
                 return;
             }
@@ -459,30 +489,20 @@ pub(super) fn run(
             Capture::disabled(events.clone())
         };
         let instance = GetModuleHandleW(ptr::null());
+        let icons = ApplicationIcons::load(instance)?;
         let class_name = wide(&format!("YuYbUuRuTray_{}", std::process::id()));
-        let class = WNDCLASSW {
+        let class = WNDCLASSEXW {
+            cbSize: size_of::<WNDCLASSEXW>() as u32,
             lpfnWndProc: Some(window_proc),
             hInstance: instance,
+            hIcon: icons.large,
+            hIconSm: icons.small,
             lpszClassName: class_name.as_ptr(),
-            ..WNDCLASSW::default()
+            ..WNDCLASSEXW::default()
         };
-        if RegisterClassW(&class) == 0 {
-            bail!("RegisterClassW: {}", std::io::Error::last_os_error());
+        if RegisterClassExW(&class) == 0 {
+            bail!("RegisterClassExW: {}", std::io::Error::last_os_error());
         }
-        let icon = options.icon_path.as_ref().and_then(|file| {
-            let path = wide_path(file);
-            let icon = LoadImageW(
-                ptr::null_mut(),
-                path.as_ptr(),
-                IMAGE_ICON,
-                32,
-                32,
-                LR_LOADFROMFILE,
-            );
-            (!icon.is_null()).then_some(icon as HICON)
-        });
-        let own_icon = icon.is_some();
-        let icon = icon.unwrap_or_else(|| LoadIconW(ptr::null_mut(), IDI_APPLICATION));
         let taskbar_created = RegisterWindowMessageW(wide("TaskbarCreated").as_ptr());
         let alive = Arc::new(AtomicBool::new(true));
         let busy = Arc::new(AtomicBool::new(false));
@@ -492,8 +512,7 @@ pub(super) fn run(
             capture,
             holds: RefCell::default(),
             hwnd: Cell::new(ptr::null_mut()),
-            icon,
-            own_icon,
+            icons,
             status: RefCell::new("待命".into()),
             taskbar_created,
             added: Cell::new(false),
@@ -517,13 +536,22 @@ pub(super) fn run(
             ptr::null(),
         );
         if hwnd.is_null() {
-            if context.own_icon {
-                DestroyIcon(context.icon);
-            }
             UnregisterClassW(class_name.as_ptr(), instance);
             bail!("CreateWindowExW: {}", std::io::Error::last_os_error());
         }
         context.hwnd.set(hwnd);
+        SendMessageW(
+            hwnd,
+            WM_SETICON,
+            ICON_BIG as WPARAM,
+            context.icons.large as LPARAM,
+        );
+        SendMessageW(
+            hwnd,
+            WM_SETICON,
+            ICON_SMALL as WPARAM,
+            context.icons.small as LPARAM,
+        );
         SetWindowLongPtrW(hwnd, GWLP_USERDATA, (&*context as *const Context) as isize);
         if taskbar_created != 0 {
             ChangeWindowMessageFilterEx(hwnd, taskbar_created, MSGFLT_ALLOW, ptr::null_mut());
@@ -629,9 +657,6 @@ pub(super) fn run(
         }
         SetWindowLongPtrW(hwnd, GWLP_USERDATA, 0);
         DestroyWindow(hwnd);
-        if context.own_icon {
-            DestroyIcon(context.icon);
-        }
         UnregisterClassW(class_name.as_ptr(), instance);
         if let Ok(worker) = output_worker {
             if worker.is_finished() {

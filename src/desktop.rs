@@ -157,7 +157,6 @@ impl BudgetEventReceiver {
 pub struct DesktopOptions {
     pub base_dir: PathBuf,
     pub portaudio_dll: PathBuf,
-    pub icon_path: Option<PathBuf>,
     pub enable_hooks: bool,
     pub enable_capture: bool,
     pub restore_clipboard: bool,
@@ -166,21 +165,10 @@ pub struct DesktopOptions {
 impl DesktopOptions {
     pub fn new(base_dir: impl Into<PathBuf>) -> Self {
         let base_dir = base_dir.into();
-        let candidates = [
-            base_dir.join("native/libportaudio64bit.dll"),
-            base_dir.join("internal/_sounddevice_data/portaudio-binaries/libportaudio64bit.dll"),
-            base_dir.join("assets/libportaudio64bit.dll"),
-        ];
-        let portaudio_dll = candidates
-            .iter()
-            .find(|path| path.is_file())
-            .cloned()
-            .unwrap_or_else(|| candidates[0].clone());
-        let icon = base_dir.join("assets/icon.ico");
+        let portaudio_dll = crate::paths::AppPaths::new(&base_dir).portaudio();
         Self {
             base_dir,
             portaudio_dll,
-            icon_path: icon.is_file().then_some(icon),
             enable_hooks: true,
             enable_capture: true,
             restore_clipboard: true,

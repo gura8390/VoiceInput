@@ -12,13 +12,13 @@ The installed CPU ORT reports C API version **1.24.4**, file version
 [`v1.24.4`](https://github.com/microsoft/onnxruntime/tree/v1.24.4) resolves to
 `2d924974ef147392ced8409d36bd6d2e7fcc8a74`.
 
-Use `tools/prepare_ort_cuda_runtime.py`,
-`tools/prepare_ort_cuda_dependencies.py` and `tools/inspect_ort_cuda_closure.py`
+Use `tools/research/prepare_ort_cuda_runtime.py`,
+`tools/research/prepare_ort_cuda_dependencies.py` and `tools/research/inspect_ort_cuda_closure.py`
 for selective ZIP member retrieval, member CRC/SHA verification and static PE
 closure. Full archive hashes are only published metadata when the full archive
 was not downloaded. These scripts do not create ORT sessions or initialize CUDA.
 
-`tools/stage_ort_cuda_encoder.py` only adds a new `runtime-ort-gpu/capi`
+`tools/research/stage_ort_cuda_encoder.py` only adds a new `runtime/onnx-cuda`
 directory inside an existing isolated research app. It refuses any target
 outside this checkout's `evidence/runtimes`. It does not change the CPU `internal`
 junction, settings, or the installed app. Staged DLLs are immutable links/copies.
@@ -32,7 +32,7 @@ seeds, thread policy and model files:
 4. GPU ORT core + `encoder_provider: "cuda_all"`.
 
 The optional `onnx_dll` setting selects the DLL; relative paths resolve against
-`app_dir`, for example `runtime-ort-gpu/capi/onnxruntime.dll`. One process can
+`app_dir`, for example `runtime/onnx-cuda/onnxruntime.dll`. One process can
 load only one ORT DLL. The owned worker receives a private PATH containing that
 directory and the CUDA decoder directory. A diagnostic that starts `worker`
 directly must set this child-process PATH itself.
@@ -116,7 +116,7 @@ PID/model prefixes. `AudioEncoder::drop` explicitly finalizes both profiles.
 A killed worker may leave empty or incomplete output; that is not accepted
 placement evidence. Shut down naturally or explicitly drop the engine.
 
-`tools/summarize_ort_profile.py` groups executed Node kernel-time events by
+`tools/research/summarize_ort_profile.py` groups executed Node kernel-time events by
 actual `args.provider` and operator. CPU shape nodes may be intentional, while
 heavy operators must be inspected separately. Merely seeing CUDA registered
 or one CUDA node does not prove all heavy computation is on GPU.

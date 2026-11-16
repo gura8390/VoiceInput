@@ -6,6 +6,8 @@ use regex::Regex;
 use serde::Serialize;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
+#[cfg(test)]
+use yuybuuru::paths;
 use std::{
     fs::{self, File, OpenOptions},
     io::Read,
@@ -228,7 +230,7 @@ fn run(args: &Args, report: &mut Value) -> Result<()> {
         "token_ids_sha256":hash(&serde_json::to_vec(&tokens)?),"token_count":tokens.len(),
         "token_ids_source":"external JSON; no sampler or expected-output generation"});
     save(&args.output, report)?;
-    let dll_dir = args.app_dir.join("core/server/engines/llama/bin");
+    let dll_dir = yuybuuru::paths::AppPaths::new(&args.app_dir).llama();
     let model_path = args
         .app_dir
         .join("models/Qwen3-ASR/Qwen3-ASR-0.6B/qwen3_asr_llm.q4_k.gguf");
@@ -369,7 +371,7 @@ fn main() -> Result<()> {
         .create_new(true)
         .open(&log_path)
         .context("Refusing to replace an existing native log")?;
-    let native_bin = args.app_dir.join("core/server/engines/llama/bin");
+    let native_bin = yuybuuru::paths::AppPaths::new(&args.app_dir).llama();
     let old_path = std::env::var_os("PATH").unwrap_or_default();
     let path = std::env::join_paths(
         std::iter::once(native_bin.clone()).chain(std::env::split_paths(&old_path)),

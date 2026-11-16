@@ -1,19 +1,19 @@
 #![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use std::{io::Write, path::PathBuf};
 use yuybuuru::{
-    application,
+    application, automation,
     config::{AsrModel, Settings},
     engine::{Engine, EngineOptions},
-    media, worker,
+    media, paths::AppPaths, worker,
 };
 
 #[derive(Parser)]
 #[command(
     version,
-    about = "Offline Qwen3-ASR dictation, hotwords and file transcription"
+    about = "本机离线听写、热词修正与音视频转录"
 )]
 struct Cli {
     #[arg(long, global = true)]
@@ -34,6 +34,11 @@ struct Cli {
 }
 #[derive(Subcommand)]
 enum Mode {
+    /// 供本机自动化工具使用的 JSON 接口，不显示新窗口。
+    Automation {
+        #[command(subcommand)]
+        command: automation::Command,
+    },
     Desktop {
         #[arg(long)]
         passive: bool,
@@ -80,13 +85,80 @@ impl Cli {
     }
 }
 fn main() {
-    if let Err(error) = run() {
-        eprintln!("{error:#}");
-        std::process::exit(1)
+    let automation_requested = std::env::args_os().any(|value| value == "automation");
+    let cli = match Cli::try_parse() {
+        Ok(cli) => cli,
+        Err(error)
+            if automation_requested
+                && matches!(
+                    error.kind(),
+                    clap::error::ErrorKind::DisplayHelp | clap::error::ErrorKind::DisplayVersion
+                ) =>
+        {
+            let result = serde_json::json!({
+                "schema": 1, "ok": true, "action": "help",
+                "data": {"help": error.to_string()}
+            });
+            let _ = write_json(&result);
+            return;
+        }
+        Err(error) if automation_requested => {
+            let result = automation::failure(
+                "arguments",
+                "invalid_arguments",
+                "自动化命令参数无效",
+                &error.to_string(),
+            );
+            let _ = write_json(&result);
+            std::process::exit(2);
+        }
+        Err(error) => error.exit(),
+    };
+    let action = match &cli.command {
+        Some(Mode::Automation { command }) => Some(command.name()),
+        _ => None,
+    };
+    if let Err(error) = run(cli) {
+        if let Some(action) = action {
+            let result = automation::failure(
+                action,
+                "operation_failed",
+                "自动化操作失败",
+                &format!("{error:#}"),
+            );
+            let _ = write_json(&result);
+        } else {
+            eprintln!("{error:#}");
+        }
+        std::process::exit(1);
     }
 }
-fn run() -> Result<()> {
-    let cli = Cli::parse();
+fn write_json(value: &serde_json::Value) -> Result<()> {
+    let mut output = std::io::stdout().lock();
+    serde_json::to_writer(&mut output, value)?;
+    output.write_all(b"\n")?;
+    output.flush()?;
+    Ok(())
+}
+fn run(cli: Cli) -> Result<()> {
+    if let Some(Mode::Automation { command }) = &cli.command {
+        let config = cli
+            .config
+            .clone()
+            .unwrap_or(
+                AppPaths::new(
+                    std::env::current_exe()?.parent().context("Executable directory")?,
+                ).settings(),
+            );
+        let config = if config.is_absolute() {
+            config
+        } else {
+            std::env::current_dir()?.join(config)
+        };
+        let response =
+            automation::execute(command, &config, cli.app_dir.as_deref(), cli.asr_model)?;
+        return write_json(&response);
+    }
     if let Some(Mode::Worker { settings_json }) = &cli.command {
         let mut settings = serde_json::from_str(settings_json)?;
         cli.apply_overrides(&mut settings);
@@ -94,7 +166,7 @@ fn run() -> Result<()> {
     }
     let default_config = std::env::current_exe()?
         .parent()
-        .map(|dir| dir.join("settings.json"));
+        .map(|dir| AppPaths::new(dir).settings());
     let config_path = cli
         .config
         .as_deref()
@@ -102,6 +174,7 @@ fn run() -> Result<()> {
     let mut settings = Settings::load(config_path, cli.app_dir.as_deref())?;
     cli.apply_overrides(&mut settings);
     match cli.command.unwrap_or(Mode::Desktop { passive: false }) {
+        Mode::Automation { .. } => unreachable!(),
         Mode::Desktop { passive } => application::desktop(settings, cli.seed, passive),
         Mode::Serve => worker::serve(settings),
         Mode::Worker { .. } => unreachable!(),
@@ -154,6 +227,40 @@ fn application_options(settings: &Settings) -> EngineOptions {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn automation_config_accepts_global_model_and_explicit_boolean_values() {
+        let cli = Cli::try_parse_from([
+            "语音输入",
+            "automation",
+            "config",
+            "--asr-model",
+            "1.7b",
+            "--hotwords",
+            "false",
+            "--hotword-rules",
+            "true",
+        ])
+        .unwrap();
+        assert_eq!(cli.asr_model, Some(AsrModel::Qwen3Asr17B));
+        match cli.command.unwrap() {
+            Mode::Automation {
+                command:
+                    automation::Command::Config {
+                        hotwords,
+                        hotword_rules,
+                    },
+            } => {
+                assert_eq!(hotwords, Some(false));
+                assert_eq!(hotword_rules, Some(true));
+            }
+            _ => panic!("Expected automation configuration command"),
+        }
+        assert!(
+            Cli::try_parse_from(["语音输入", "automation", "startup", "--enabled", "invalid"])
+                .is_err()
+        );
+    }
 
     #[test]
     fn model_option_is_global_and_cli_overrides_config() {

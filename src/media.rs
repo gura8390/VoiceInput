@@ -10,7 +10,7 @@ use std::{
 
 const CREATE_NO_WINDOW: u32 = 0x08000000;
 pub fn ffmpeg_path(app: &Path) -> PathBuf {
-    app.join("ffmpeg.exe")
+    crate::paths::AppPaths::new(app).ffmpeg()
 }
 pub fn stream_audio(
     app: &Path,

@@ -262,8 +262,10 @@ pub(super) struct NativeModel {
 // owned by its inference worker; moving an engine does not share its context.
 unsafe impl Send for NativeModel {}
 impl NativeModel {
-    pub fn load(dll_dir: &Path, path: &Path, gpu: bool) -> Result<Self> {
-        Self::load_with_backend(dll_dir, path, gpu, super::GpuBackend::Cuda)
+    pub fn load_cpu_aligner(dll_dir: &Path, path: &Path) -> Result<Self> {
+        // Retain native CPU repacking: disabling it changes a timestamp at a
+        // close argmax boundary in the complete-file regression workload.
+        Self::load_model(dll_dir, path, None)
     }
     pub fn load_with_backend(
         dll_dir: &Path,
@@ -271,6 +273,10 @@ impl NativeModel {
         gpu: bool,
         backend: super::GpuBackend,
     ) -> Result<Self> {
+        Self::load_model(dll_dir, path, gpu.then_some(backend))
+    }
+    fn load_model(dll_dir: &Path, path: &Path, backend: Option<super::GpuBackend>) -> Result<Self> {
+        let gpu = backend.is_some();
         let stage = std::time::Instant::now();
         let api = Api::get(dll_dir)?;
         super::load_timing("llama.api_init", stage);
@@ -278,7 +284,7 @@ impl NativeModel {
         let mut params = unsafe { (api.llama_model_default_params)() };
         params.n_gpu_layers = -1;
         let mut selected_devices = [ptr::null_mut(), ptr::null_mut()];
-        if gpu {
+        if let Some(backend) = backend {
             let name = match backend {
                 super::GpuBackend::Cuda => c"CUDA0",
                 super::GpuBackend::Vulkan => c"Vulkan0",
@@ -294,6 +300,12 @@ impl NativeModel {
         // An explicit null-only list requests CPU for the file aligner. A named
         // GPU list prevents backend scoring from silently selecting another route.
         params.devices = selected_devices.as_mut_ptr();
+        if std::env::var_os("YYUR_PROFILE_LOAD").is_some() {
+            eprintln!(
+                "YYUR_MODEL_LOAD {}",
+                serde_json::json!({"gpu":gpu,"use_mmap":params.use_mmap,"use_extra_bufts":params.use_extra_bufts})
+            );
+        }
         let file = path_cstring(path)?;
         let raw = unsafe { (api.llama_model_load_from_file)(file.as_ptr(), params) };
         super::load_timing("llama.gguf_load", stage);
@@ -738,9 +750,14 @@ mod tests {
             batch_threads: i32,
             cache_mib_from_existing_log: f64,
         ) -> Result<serde_json::Value> {
-            let dll_dir = app_dir.join("core/server/engines/llama/bin");
+            let dll_dir = crate::paths::AppPaths::new(app_dir).llama();
             let model_path = app_dir.join(model_relative);
-            let model = NativeModel::load(&dll_dir, &model_path, gpu)?;
+            let model = NativeModel::load_with_backend(
+                &dll_dir,
+                &model_path,
+                gpu,
+                super::super::GpuBackend::Cuda,
+            )?;
             let ctx = NativeContext::new(&model, n_ctx, n_batch, threads, batch_threads)?;
             let api = &model.api;
             // Resolve from the already-loaded installed DLL, without extending
