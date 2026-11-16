@@ -1,6 +1,6 @@
 {
-  "app_dir": ".",
-  "asr_model": "0.6b",
+  "app_dir": "..",
+  "asr_model": "1.7b",
   "onnx_dll": null,
   "encoder_provider": "cpu",
   "encoder_frontend_arena": true,
@@ -19,7 +19,7 @@
   "gpu_backend": "vulkan",
   "cuda_graph_optimization": false,
   "asr_single_output": true,
-  "asr_dynamic_context": false,
+  "asr_dynamic_context": true,
   "hotwords": true,
   "hotword_rules": true,
   "hot_threshold": 0.85,
