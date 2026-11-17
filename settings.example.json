@@ -2,7 +2,7 @@
   "app_dir": "..",
   "asr_model": "1.7b",
   "onnx_dll": null,
-  "encoder_provider": "cpu",
+  "encoder_provider": "ggml_vulkan",
   "encoder_frontend_arena": true,
   "encoder_cuda_mem_limit_mb": 512,
   "language": "auto",
@@ -31,5 +31,6 @@
   "aligner_dynamic_context": true,
   "aligner_logits_limit": 4000,
   "file_context_handoff": true,
-  "vulkan_pipeline_cache": true
+  "vulkan_pipeline_cache": true,
+  "ggml_encoder_model": "../models/Qwen3-ASR/Qwen3-ASR-1.7B/qwen3_asr_encoder.gguf"
 }

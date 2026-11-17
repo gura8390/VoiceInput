@@ -1,0 +1,236 @@
+--- a/tools/mtmd/clip-impl.h
++++ b/tools/mtmd/clip-impl.h
+@@ -420,6 +420,7 @@
+     int nx;
+     int ny;
+     int caps_valid_rows = 0;
++    int caps_encoder_stage = 0; // 0 full, 1 frontend, 2 whole-utterance backend
+ 
+     std::vector<float> buf;
+ };
+--- a/tools/mtmd/clip.cpp
++++ b/tools/mtmd/clip.cpp
+@@ -172,6 +172,7 @@
+     uint64_t caps_gpu_metadata_nodes = 0;
+     uint64_t caps_cpu_metadata_nodes = 0;
+     uint64_t caps_unknown_nodes = 0;
++    bool caps_log_placement = true;
+ 
+     clip_ctx(clip_context_params & ctx_params) {
+         flash_attn_type = ctx_params.flash_attn_type;
+@@ -3344,6 +3345,7 @@
+                 ++ctx->caps_unknown_nodes;
+             }
+         }
++        if (ctx->caps_log_placement) {
+         LOG_INF("caps_encoder: backend=%s graph_nodes=%llu gpu_nodes=%llu cpu_nodes=%llu rows=%d\n",
+             ggml_backend_name(ctx->backend), (unsigned long long)ctx->caps_total_nodes,
+             (unsigned long long)ctx->caps_gpu_nodes, (unsigned long long)ctx->caps_cpu_nodes,
+@@ -3354,6 +3356,7 @@
+             (unsigned long long)ctx->caps_unknown_nodes);
+         for (const auto & op : cpu_ops) {
+             LOG_INF("caps_encoder: cpu_placement op=%s count=%llu\n", op.first.c_str(), (unsigned long long)op.second);
++        }
+         }
+     }
+ 
+@@ -4285,7 +4288,13 @@
+ // Isolated application-specific C ABI. No PCM preprocessing or decoder changes.
+ namespace {
+ thread_local std::string caps_encoder_error;
+-struct caps_encoder_handle { clip_ctx * ctx; int threads; };
++struct caps_encoder_handle {
++    clip_ctx * ctx;
++    int threads;
++    size_t fe_batch = 4;
++    caps_ggml_encoder_stage_metrics fe_metrics{};
++    caps_ggml_encoder_stage_metrics be_metrics{};
++};
+ }
+ uint32_t caps_ggml_encoder_abi_version(void) { return 1; }
+ const char * caps_ggml_encoder_last_error(void) { return caps_encoder_error.c_str(); }
+@@ -4299,6 +4308,13 @@
+     try {
+         if (!mmproj || !mmproj[0] || threads < 1 || threads > 256) {
+             throw std::runtime_error("invalid model path or thread count");
++        }
++        size_t fe_batch = 4;
++        if (const char * setting = std::getenv("YYUR_GGML_ENCODER_FE_BATCH")) {
++            const std::string value(setting);
++            if (value == "1") fe_batch = 1;
++            else if (value == "4") fe_batch = 4;
++            else throw std::runtime_error("YYUR_GGML_ENCODER_FE_BATCH must be exactly 1 or 4");
+         }
+         // The Rust llama API registers b9090 backends before calling this API.
+         if (ggml_backend_dev_count() == 0) throw std::runtime_error("ggml backends were not registered");
+@@ -4329,7 +4345,10 @@
+         auto result = std::make_unique<caps_encoder_handle>();
+         result->ctx = ctx.release();
+         result->threads = threads;
++        result->fe_batch = fe_batch;
++        result->ctx->caps_log_placement = false;
+         LOG_INF("caps_encoder: ABI=1 b9090 qwen3a graph backport; F16 boundary; backend=%s threads=%d\n", ggml_backend_name(result->ctx->backend), threads);
++        LOG_INF("caps_encoder_batched: fixed_frontend_batch=%zu, shared_scheduler, whole_utterance_backend\n", fe_batch);
+         return result.release();
+     } catch (const std::exception & e) {
+         caps_encoder_error = e.what();
+@@ -4372,18 +4391,90 @@
+         }
+         const size_t padded = ((frames + 99) / 100) * 100;
+         if (padded > std::numeric_limits<size_t>::max() / 128 || valid_rows > (size_t)INT_MAX) throw std::runtime_error("encoder shape overflow");
++        const int64_t encode_start = ggml_time_us();
++        enc->fe_metrics = {}; enc->be_metrics = {};
++        auto capture = [&](caps_ggml_encoder_stage_metrics & dest) {
++            auto ctx = enc->ctx;
++            dest.gpu_core += ctx->caps_gpu_core_nodes;
++            dest.cpu_core += ctx->caps_cpu_core_nodes;
++            dest.gpu_metadata += ctx->caps_gpu_metadata_nodes;
++            dest.cpu_metadata += ctx->caps_cpu_metadata_nodes;
++            dest.unknown += ctx->caps_unknown_nodes;
++            ++dest.graph_calls;
++            dest.gpu_compute_bytes = std::max<uint64_t>(dest.gpu_compute_bytes,
++                ctx->backend == ctx->backend_cpu ? 0 : ggml_backend_sched_get_buffer_size(ctx->sched.get(), ctx->backend));
++            dest.cpu_compute_bytes = std::max<uint64_t>(dest.cpu_compute_bytes,
++                ggml_backend_sched_get_buffer_size(ctx->sched.get(), ctx->backend_cpu));
++        };
++        const size_t feature_dim = (size_t)enc->ctx->model.hparams.n_embd;
++        if (!feature_dim || valid_rows > std::numeric_limits<size_t>::max() / feature_dim) throw std::runtime_error("hidden shape overflow");
++        std::vector<float> hidden(valid_rows * feature_dim);
++        size_t emitted_rows = 0;
++        const size_t batch_frames = enc->fe_batch * 100;
++        for (size_t offset = 0; offset < frames; offset += batch_frames) {
++            const size_t copied_frames = std::min(batch_frames, frames - offset);
++            const size_t batch_rows = std::min(valid_rows - emitted_rows, caps_ggml_encoder_output_rows(copied_frames));
++            if (!batch_rows) throw std::runtime_error("empty frontend microbatch");
++            clip_image_f32_batch batch;
++            batch.is_audio = true;
++            auto image = clip_image_f32_ptr(clip_image_f32_init());
++            image->nx = (int)batch_frames;
++            image->ny = 128;
++            image->caps_valid_rows = (int)batch_rows;
++            image->caps_encoder_stage = 1;
++            image->buf.assign(128 * batch_frames, 0.0f);
++            for (size_t band = 0; band < 128; ++band) {
++                std::copy(mel + band * frames + offset, mel + band * frames + offset + copied_frames,
++                    image->buf.begin() + band * batch_frames);
++            }
++            batch.entries.push_back(std::move(image));
++            if (!clip_image_batch_encode(enc->ctx, enc->threads, &batch, hidden.data() + emitted_rows * feature_dim)) {
++                throw std::runtime_error("ggml frontend microbatch failed; see native log");
++            }
++            capture(enc->fe_metrics);
++            emitted_rows += batch_rows;
++        }
++        if (emitted_rows != valid_rows) throw std::runtime_error("frontend row count differs");
++        const int64_t fe_end = ggml_time_us();
++        enc->fe_metrics.elapsed_seconds = (fe_end - encode_start) / 1000000.0;
+         clip_image_f32_batch batch;
+         batch.is_audio = true;
+         auto image = clip_image_f32_ptr(clip_image_f32_init());
+-        image->nx = (int)padded;
+-        image->ny = 128;
++        image->nx = (int)valid_rows;
++        image->ny = (int)feature_dim;
+         image->caps_valid_rows = (int)valid_rows;
+-        image->buf.assign(128 * padded, 0.0f);
+-        for (size_t band = 0; band < 128; ++band) {
+-            std::copy(mel + band * frames, mel + (band + 1) * frames, image->buf.begin() + band * padded);
+-        }
++        image->caps_encoder_stage = 2;
++        image->buf = std::move(hidden);
+         batch.entries.push_back(std::move(image));
+-        if (!clip_image_batch_encode(enc->ctx, enc->threads, &batch, out)) throw std::runtime_error("ggml encoder failed; see native log");
++        if (!clip_image_batch_encode(enc->ctx, enc->threads, &batch, out)) throw std::runtime_error("ggml whole-utterance backend failed; see native log");
++        capture(enc->be_metrics);
++        enc->be_metrics.elapsed_seconds = (ggml_time_us() - fe_end) / 1000000.0;
++        auto ctx = enc->ctx;
++        const auto & fe = enc->fe_metrics; const auto & be = enc->be_metrics;
++        ctx->caps_gpu_core_nodes = fe.gpu_core + be.gpu_core;
++        ctx->caps_cpu_core_nodes = fe.cpu_core + be.cpu_core;
++        ctx->caps_gpu_metadata_nodes = fe.gpu_metadata + be.gpu_metadata;
++        ctx->caps_cpu_metadata_nodes = fe.cpu_metadata + be.cpu_metadata;
++        ctx->caps_unknown_nodes = fe.unknown + be.unknown;
++        ctx->caps_gpu_nodes = ctx->caps_gpu_core_nodes + ctx->caps_gpu_metadata_nodes;
++        ctx->caps_cpu_nodes = ctx->caps_cpu_core_nodes + ctx->caps_cpu_metadata_nodes;
++        ctx->caps_total_nodes = ctx->caps_gpu_nodes + ctx->caps_cpu_nodes + ctx->caps_unknown_nodes;
++        LOG_INF("caps_encoder_batched: fe_batch=%zu fe_calls=%llu frames=%zu rows=%zu fe_seconds=%.6f be_seconds=%.6f total_seconds=%.6f\n",
++            enc->fe_batch, (unsigned long long)fe.graph_calls, frames, valid_rows,
++            fe.elapsed_seconds, be.elapsed_seconds, fe.elapsed_seconds + be.elapsed_seconds);
++        LOG_INF("caps_encoder_batched: fe_gpu_core=%llu fe_cpu_core=%llu be_gpu_core=%llu be_cpu_core=%llu gpu_compute_bytes=%llu cpu_compute_bytes=%llu\n",
++            (unsigned long long)fe.gpu_core, (unsigned long long)fe.cpu_core,
++            (unsigned long long)be.gpu_core, (unsigned long long)be.cpu_core,
++            (unsigned long long)std::max(fe.gpu_compute_bytes, be.gpu_compute_bytes),
++            (unsigned long long)std::max(fe.cpu_compute_bytes, be.cpu_compute_bytes));
++        LOG_INF("YYUR_GGML_NATIVE_STAGES {\"batch\":%zu,\"frames\":%zu,\"rows\":%zu,\"fe_seconds\":%.6f,\"be_seconds\":%.6f,\"total_seconds\":%.6f,\"gpu_compute_bytes\":%llu,\"cpu_compute_bytes\":%llu,\"fe_calls\":%llu,\"fe_gpu_core\":%llu,\"fe_cpu_core\":%llu,\"be_gpu_core\":%llu,\"be_cpu_core\":%llu}\n",
++            enc->fe_batch, frames, valid_rows, fe.elapsed_seconds, be.elapsed_seconds,
++            fe.elapsed_seconds + be.elapsed_seconds,
++            (unsigned long long)std::max(fe.gpu_compute_bytes, be.gpu_compute_bytes),
++            (unsigned long long)std::max(fe.cpu_compute_bytes, be.cpu_compute_bytes),
++            (unsigned long long)fe.graph_calls,
++            (unsigned long long)fe.gpu_core, (unsigned long long)fe.cpu_core,
++            (unsigned long long)be.gpu_core, (unsigned long long)be.cpu_core);
+         return 0;
+     } catch (const std::exception & e) {
+         caps_encoder_error = e.what();
+@@ -4396,3 +4487,10 @@
+     clip_free(enc->ctx);
+     delete enc;
+ }
++
++int32_t caps_ggml_encoder_get_stage_metrics(void * handle, int32_t stage, caps_ggml_encoder_stage_metrics * out) {
++    if (!handle || !out || (stage != 1 && stage != 2)) return -1;
++    auto enc = static_cast<caps_encoder_handle *>(handle);
++    *out = stage == 1 ? enc->fe_metrics : enc->be_metrics;
++    return 0;
++}
+--- a/tools/mtmd/models/qwen3a.cpp
++++ b/tools/mtmd/models/qwen3a.cpp
+@@ -1,6 +1,22 @@
+ #include "models.h"
+ 
+ ggml_cgraph * clip_graph_qwen3a::build() {
++    // FE microbatches and the full BE share the same weights/backend/scheduler.
++    // Stage 2 consumes the concatenated F16-boundary FE features directly.
++    if (img.caps_encoder_stage == 2) {
++        GGML_ASSERT(img.caps_valid_rows > 0);
++        ggml_tensor * hidden = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, n_embd, img.caps_valid_rows);
++        ggml_set_name(hidden, "inp_raw");
++        ggml_set_input(hidden);
++        ggml_tensor * cur = build_vit(hidden, img.caps_valid_rows,
++            NORM_TYPE_NORMAL, hparams.ffn_op, nullptr, nullptr);
++        cb(cur, "after_transformer", -1);
++        cur = build_ffn(cur, model.mm_1_w, model.mm_1_b, nullptr, nullptr,
++            model.mm_2_w, model.mm_2_b, FFN_GELU_ERF, -1);
++        cb(cur, "projected", -1);
++        ggml_build_forward_expand(gf, cur);
++        return gf;
++    }
+     // Ref implementation: https://github.com/QwenLM/Qwen3-ASR/blob/main/qwen_asr/core/transformers_backend/modeling_qwen3_asr.py
+ 
+     // inp_raw: [n_frames, n_mel, 1]  (nx=n_frames, ny=n_mel)
+@@ -77,6 +93,10 @@
+             img.caps_valid_rows, inp->nb[1], 0));
+         inp = ggml_cast(ctx0, ggml_cast(ctx0, inp, GGML_TYPE_F16), GGML_TYPE_F32);
+     }
++    if (img.caps_encoder_stage == 1) {
++        ggml_build_forward_expand(gf, inp);
++        return gf;
++    }
+     const int64_t effective_pos = img.caps_valid_rows > 0 ? img.caps_valid_rows : n_pos;
+ 
+     ggml_tensor * cur = build_vit(inp, effective_pos,
+--- a/tools/mtmd/caps-encoder.h
++++ b/tools/mtmd/caps-encoder.h
+@@ -9,6 +9,12 @@
+ #ifdef __cplusplus
+ extern "C" {
+ #endif
++typedef struct caps_ggml_encoder_stage_metrics {
++    uint64_t gpu_core, cpu_core, gpu_metadata, cpu_metadata, unknown;
++    uint64_t graph_calls, gpu_compute_bytes, cpu_compute_bytes;
++    double elapsed_seconds;
++} caps_ggml_encoder_stage_metrics;
++CAPS_ENCODER_API int32_t caps_ggml_encoder_get_stage_metrics(void * handle, int32_t stage, caps_ggml_encoder_stage_metrics * out);
+ CAPS_ENCODER_API uint32_t caps_ggml_encoder_abi_version(void);
+ CAPS_ENCODER_API void * caps_ggml_encoder_load(const char * mmproj, const char * device_name, int32_t threads, int32_t use_gpu);
+ CAPS_ENCODER_API int32_t caps_ggml_encoder_dimension(void * handle);

@@ -60,6 +60,7 @@ pub struct EngineOptions {
     pub aligner_model_dir: Option<PathBuf>,
     pub onnx_dll: Option<PathBuf>,
     pub encoder_provider: EncoderProvider,
+    pub ggml_encoder_model: Option<PathBuf>,
     pub encoder_cuda_mem_limit_mb: usize,
     pub encoder_frontend_threads: Option<usize>,
     pub encoder_frontend_arena: bool,
@@ -97,6 +98,7 @@ impl Default for EngineOptions {
             aligner_model_dir: None,
             onnx_dll: None,
             encoder_provider: EncoderProvider::Cpu,
+            ggml_encoder_model: None,
             encoder_cuda_mem_limit_mb: 512,
             encoder_frontend_threads: None,
             encoder_frontend_arena: false,
@@ -205,7 +207,9 @@ impl Engine {
         let load_started = Instant::now();
         let spec = options.asr_model.spec();
         let dir = options.asr_model_directory(app_dir);
-        for name in [spec.frontend, spec.backend, spec.decoder] {
+        let uses_ggml = AudioEncoder::uses_ggml(spec.frontend, options)?;
+        let required = if uses_ggml { vec![spec.decoder] } else { vec![spec.frontend, spec.backend, spec.decoder] };
+        for name in required {
             let file = dir.join(name);
             ensure!(
                 file.is_file(),
@@ -214,7 +218,11 @@ impl Engine {
                 file.display()
             );
         }
-        require_encoder_sidecars(&dir, spec.frontend, spec.backend)?;
+        if uses_ggml {
+            let model = AudioEncoder::model_path(&dir, options);
+            let metadata = model.metadata().with_context(|| format!("读取 GGML 编码模型失败：{}", model.display()))?;
+            ensure!(metadata.is_file() && metadata.len() > 0, "GGML 编码模型为空或不是文件：{}", model.display());
+        } else { require_encoder_sidecars(&dir, spec.frontend, spec.backend)?; }
         // The encoder and decoder own independent runtimes and immutable model
         // inputs. Overlap their initialization without changing inference order.
         // Always join the encoder, including when decoder initialization fails.

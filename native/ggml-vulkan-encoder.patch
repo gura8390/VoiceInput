@@ -1,0 +1,545 @@
+--- a/tools/mtmd/CMakeLists.txt
++++ b/tools/mtmd/CMakeLists.txt
+@@ -45,6 +45,7 @@
+             )
+ 
+ set_target_properties(mtmd PROPERTIES
++    OUTPUT_NAME caps_encoder
+     VERSION ${LLAMA_INSTALL_VERSION}
+     SOVERSION 0
+     MACHO_CURRENT_VERSION 0 # keep macOS linker from seeing oversized version number
+--- a/tools/mtmd/clip.h
++++ b/tools/mtmd/clip.h
+@@ -40,6 +40,7 @@
+     bool warmup;
+     ggml_backend_sched_eval_callback cb_eval;
+     void * cb_eval_user_data;
++    const char * caps_backend_device = nullptr; // isolated POC only, strict selection
+ };
+ 
+ struct clip_init_result {
+--- a/tools/mtmd/clip-impl.h
++++ b/tools/mtmd/clip-impl.h
+@@ -419,6 +419,7 @@
+ struct clip_image_f32 {
+     int nx;
+     int ny;
++    int caps_valid_rows = 0;
+ 
+     std::vector<float> buf;
+ };
+--- a/tools/mtmd/clip.cpp
++++ b/tools/mtmd/clip.cpp
+@@ -1,4 +1,6 @@
+ #include "clip.h"
++#include "caps-encoder.h"
++#include <limits>
+ #include "clip-impl.h"
+ #include "clip-model.h"
+ #include "clip-graph.h"
+@@ -16,6 +18,7 @@
+ #include <cstdlib>
+ #include <cstring>
+ #include <fstream>
++#include <filesystem>
+ #include <map>
+ #include <stdexcept>
+ #include <unordered_set>
+@@ -161,6 +164,14 @@
+     bool is_allocated = false;
+ 
+     bool debug_output_embeddings = false;
++    uint64_t caps_gpu_nodes = 0;
++    uint64_t caps_cpu_nodes = 0;
++    uint64_t caps_total_nodes = 0;
++    uint64_t caps_gpu_core_nodes = 0;
++    uint64_t caps_cpu_core_nodes = 0;
++    uint64_t caps_gpu_metadata_nodes = 0;
++    uint64_t caps_cpu_metadata_nodes = 0;
++    uint64_t caps_unknown_nodes = 0;
+ 
+     clip_ctx(clip_context_params & ctx_params) {
+         flash_attn_type = ctx_params.flash_attn_type;
+@@ -169,8 +180,21 @@
+             throw std::runtime_error("failed to initialize CPU backend");
+         }
+         if (ctx_params.use_gpu) {
+-            auto backend_name = std::getenv("MTMD_BACKEND_DEVICE");
+-            if (backend_name != nullptr) {
++            if (ctx_params.caps_backend_device && ctx_params.caps_backend_device[0]) {
++                ggml_backend_dev_t dev = ggml_backend_dev_by_name(ctx_params.caps_backend_device);
++                if (!dev || (ggml_backend_dev_type(dev) != GGML_BACKEND_DEVICE_TYPE_GPU &&
++                             ggml_backend_dev_type(dev) != GGML_BACKEND_DEVICE_TYPE_IGPU)) {
++                    ggml_backend_free(backend_cpu);
++                    throw std::runtime_error("requested GPU backend device is unavailable");
++                }
++                backend = ggml_backend_dev_init(dev, nullptr);
++                if (!backend) {
++                    ggml_backend_free(backend_cpu);
++                    throw std::runtime_error("requested GPU backend initialization failed");
++                }
++            }
++            auto backend_name = ctx_params.caps_backend_device ? ctx_params.caps_backend_device : std::getenv("MTMD_BACKEND_DEVICE");
++            if (!backend && backend_name != nullptr) {
+                 backend = ggml_backend_init_by_name(backend_name, nullptr);
+                 if (!backend) {
+                     LOG_WRN("%s: Warning: Failed to initialize \"%s\" backend, falling back to default GPU backend\n", __func__, backend_name);
+@@ -224,6 +248,12 @@
+         return model.proj_type;
+     }
+ };
++
++static ggml_tensor * caps_bias_f32(ggml_context * ctx, ggml_tensor * tensor) {
++    // Promoting stored F16 bias/position values is exact and keeps CPU fallback
++    // compatible with ggml's F32 activation path. We do not alter stored weights.
++    return tensor && tensor->type == GGML_TYPE_F16 ? ggml_cast(ctx, tensor, GGML_TYPE_F32) : tensor;
++}
+ 
+ //
+ // clip_graph
+@@ -303,7 +333,7 @@
+             std::function<ggml_tensor *(ggml_tensor *, const clip_layer &)> add_pos
+         ) {
+     if (learned_pos_embd) {
+-        inp = ggml_add(ctx0, inp, learned_pos_embd);
++        inp = ggml_add(ctx0, inp, caps_bias_f32(ctx0, learned_pos_embd));
+         cb(inp, "pos_embed", -1);
+     }
+ 
+@@ -333,7 +363,7 @@
+                 // fused qkv
+                 cur = build_mm(layer.qkv_w, cur);
+                 if (layer.qkv_b != nullptr) {
+-                    cur = ggml_add(ctx0, cur, layer.qkv_b);
++                    cur = ggml_add(ctx0, cur, caps_bias_f32(ctx0, layer.qkv_b));
+                 }
+ 
+                 Qcur = ggml_view_3d(ctx0, cur, d_head, n_head, n_pos,
+@@ -367,17 +397,17 @@
+                 // separate q, k, v
+                 Qcur = build_mm(layer.q_w, cur);
+                 if (layer.q_b) {
+-                    Qcur = ggml_add(ctx0, Qcur, layer.q_b);
++                    Qcur = ggml_add(ctx0, Qcur, caps_bias_f32(ctx0, layer.q_b));
+                 }
+ 
+                 Kcur = build_mm(layer.k_w, cur);
+                 if (layer.k_b) {
+-                    Kcur = ggml_add(ctx0, Kcur, layer.k_b);
++                    Kcur = ggml_add(ctx0, Kcur, caps_bias_f32(ctx0, layer.k_b));
+                 }
+ 
+                 Vcur = build_mm(layer.v_w, cur);
+                 if (layer.v_b) {
+-                    Vcur = ggml_add(ctx0, Vcur, layer.v_b);
++                    Vcur = ggml_add(ctx0, Vcur, caps_bias_f32(ctx0, layer.v_b));
+                 }
+ 
+                 // if true, norm must be applied after reshaping to (d_head, n_head, n_pos)
+@@ -539,7 +569,7 @@
+     }
+ 
+     if (mb) {
+-        cur = ggml_add(ctx0, cur, mb);
++        cur = ggml_add(ctx0, cur, caps_bias_f32(ctx0, mb));
+         cb(cur, "norm_b", il);
+     }
+ 
+@@ -561,7 +591,7 @@
+     cb(tmp, "ffn_up", il);
+ 
+     if (up_b) {
+-        tmp = ggml_add(ctx0, tmp, up_b);
++        tmp = ggml_add(ctx0, tmp, caps_bias_f32(ctx0, up_b));
+         cb(tmp, "ffn_up_b", il);
+     }
+ 
+@@ -570,7 +600,7 @@
+         cb(cur, "ffn_gate", il);
+ 
+         if (gate_b) {
+-            cur = ggml_add(ctx0, cur, gate_b);
++            cur = ggml_add(ctx0, cur, caps_bias_f32(ctx0, gate_b));
+             cb(cur, "ffn_gate_b", il);
+         }
+     } else {
+@@ -628,7 +658,7 @@
+     }
+ 
+     if (down_b) {
+-        cur = ggml_add(ctx0, cur, down_b);
++        cur = ggml_add(ctx0, cur, caps_bias_f32(ctx0, down_b));
+     }
+ 
+     return cur;
+@@ -690,7 +720,7 @@
+     }
+ 
+     if (wo_b) {
+-        cur = ggml_add(ctx0, cur, wo_b);
++        cur = ggml_add(ctx0, cur, caps_bias_f32(ctx0, wo_b));
+     }
+ 
+     return cur;
+@@ -1615,7 +1645,7 @@
+         std::map<std::string, size_t> tensor_offset;
+         std::vector<ggml_tensor *> tensors_to_load;
+ 
+-        auto fin = std::ifstream(fname, std::ios::binary);
++        auto fin = std::ifstream(std::filesystem::u8path(fname), std::ios::binary);
+         if (!fin) {
+             throw std::runtime_error(string_format("%s: failed to open %s\n", __func__, fname.c_str()));
+         }
+@@ -3197,12 +3227,7 @@
+             } break;
+         case PROJECTOR_TYPE_QWEN3A:
+             {
+-                // 3x stride-2 conv2d: each step is floor((n-1)/2)+1
+-                int n = img->nx;
+-                n = (n - 1) / 2 + 1;
+-                n = (n - 1) / 2 + 1;
+-                n = (n - 1) / 2 + 1;
+-                n_patches = n;
++                n_patches = img->caps_valid_rows > 0 ? img->caps_valid_rows : (img->nx / 100) * 13;
+             } break;
+         case PROJECTOR_TYPE_GLMA:
+             {
+@@ -3292,7 +3317,45 @@
+     // build the inference graph
+     ggml_backend_sched_reset(ctx->sched.get());
+     ggml_cgraph * gf = clip_image_build_graph(ctx, imgs);
+-    ggml_backend_sched_alloc_graph(ctx->sched.get(), gf);
++    if (!ggml_backend_sched_alloc_graph(ctx->sched.get(), gf)) {
++        LOG_ERR("%s: graph allocation failed\n", __func__);
++        return false;
++    }
++    if (imgs.entries[0]->caps_valid_rows > 0) {
++        ctx->caps_gpu_nodes = ctx->caps_cpu_nodes = 0;
++        ctx->caps_gpu_core_nodes = ctx->caps_cpu_core_nodes = 0;
++        ctx->caps_gpu_metadata_nodes = ctx->caps_cpu_metadata_nodes = 0;
++        ctx->caps_unknown_nodes = 0;
++        ctx->caps_total_nodes = ggml_graph_n_nodes(gf);
++        std::map<std::string, uint64_t> cpu_ops;
++        for (int i = 0; i < ggml_graph_n_nodes(gf); ++i) {
++            ggml_tensor * node = ggml_graph_node(gf, i);
++            ggml_backend_t selected = ggml_backend_sched_get_tensor_backend(ctx->sched.get(), node);
++            bool metadata = node->op == GGML_OP_NONE || node->op == GGML_OP_RESHAPE ||
++                node->op == GGML_OP_VIEW || node->op == GGML_OP_PERMUTE || node->op == GGML_OP_TRANSPOSE;
++            if (selected == ctx->backend_cpu) {
++                ++ctx->caps_cpu_nodes;
++                if (metadata) ++ctx->caps_cpu_metadata_nodes; else ++ctx->caps_cpu_core_nodes;
++                ++cpu_ops[ggml_op_name(node->op)];
++            } else if (selected != nullptr) {
++                ++ctx->caps_gpu_nodes;
++                if (metadata) ++ctx->caps_gpu_metadata_nodes; else ++ctx->caps_gpu_core_nodes;
++            } else {
++                ++ctx->caps_unknown_nodes;
++            }
++        }
++        LOG_INF("caps_encoder: backend=%s graph_nodes=%llu gpu_nodes=%llu cpu_nodes=%llu rows=%d\n",
++            ggml_backend_name(ctx->backend), (unsigned long long)ctx->caps_total_nodes,
++            (unsigned long long)ctx->caps_gpu_nodes, (unsigned long long)ctx->caps_cpu_nodes,
++            imgs.entries[0]->caps_valid_rows);
++        LOG_INF("caps_encoder: gpu_core=%llu cpu_core=%llu gpu_metadata=%llu cpu_metadata=%llu unknown=%llu\n",
++            (unsigned long long)ctx->caps_gpu_core_nodes, (unsigned long long)ctx->caps_cpu_core_nodes,
++            (unsigned long long)ctx->caps_gpu_metadata_nodes, (unsigned long long)ctx->caps_cpu_metadata_nodes,
++            (unsigned long long)ctx->caps_unknown_nodes);
++        for (const auto & op : cpu_ops) {
++            LOG_INF("caps_encoder: cpu_placement op=%s count=%llu\n", op.first.c_str(), (unsigned long long)op.second);
++        }
++    }
+ 
+     // set inputs
+     const auto & model   = ctx->model;
+@@ -4218,3 +4281,118 @@
+ void clip_set_debug_output_embeddings(clip_ctx * ctx, bool enable) {
+     ctx->debug_output_embeddings = enable;
+ }
++
++// Isolated application-specific C ABI. No PCM preprocessing or decoder changes.
++namespace {
++thread_local std::string caps_encoder_error;
++struct caps_encoder_handle { clip_ctx * ctx; int threads; };
++}
++uint32_t caps_ggml_encoder_abi_version(void) { return 1; }
++const char * caps_ggml_encoder_last_error(void) { return caps_encoder_error.c_str(); }
++size_t caps_ggml_encoder_output_rows(size_t frames) {
++    const size_t full = frames / 100;
++    if (full > std::numeric_limits<size_t>::max() / 13) return 0;
++    return full * 13 + ((frames % 100) + 7) / 8;
++}
++void * caps_ggml_encoder_load(const char * mmproj, const char * device_name, int32_t threads, int32_t use_gpu) {
++    caps_encoder_error.clear();
++    try {
++        if (!mmproj || !mmproj[0] || threads < 1 || threads > 256) {
++            throw std::runtime_error("invalid model path or thread count");
++        }
++        // The Rust llama API registers b9090 backends before calling this API.
++        if (ggml_backend_dev_count() == 0) throw std::runtime_error("ggml backends were not registered");
++        if (use_gpu && (!device_name || !device_name[0])) device_name = "Vulkan0";
++        if (use_gpu) {
++            auto dev = ggml_backend_dev_by_name(device_name);
++            if (!dev || (ggml_backend_dev_type(dev) != GGML_BACKEND_DEVICE_TYPE_GPU &&
++                         ggml_backend_dev_type(dev) != GGML_BACKEND_DEVICE_TYPE_IGPU)) {
++                throw std::runtime_error(std::string("requested GPU device unavailable: ") + device_name);
++            }
++        }
++        clip_context_params params{};
++        params.use_gpu = use_gpu != 0;
++        params.flash_attn_type = CLIP_FLASH_ATTN_TYPE_DISABLED;
++        params.warmup = false;
++        params.caps_backend_device = device_name;
++        auto loaded = clip_init(mmproj, params);
++        if (loaded.ctx_v) clip_free(loaded.ctx_v);
++        std::unique_ptr<clip_ctx, decltype(&clip_free)> ctx(loaded.ctx_a, &clip_free);
++        if (!ctx) throw std::runtime_error("unable to load audio mmproj; see native log");
++        if (ctx->proj_type() != PROJECTOR_TYPE_QWEN3A) throw std::runtime_error("mmproj is not Qwen3A");
++        if (use_gpu && ctx->backend == ctx->backend_cpu) throw std::runtime_error("GPU device initialization fell back to CPU");
++        for (ggml_tensor * t = ggml_get_first_tensor(ctx->ctx_data.get()); t; t = ggml_get_next_tensor(ctx->ctx_data.get(), t)) {
++            if (t->type != GGML_TYPE_F16 && t->type != GGML_TYPE_F32) {
++                throw std::runtime_error(std::string("POC requires F16/F32 weights, found ") + ggml_type_name(t->type) + " tensor " + t->name);
++            }
++        }
++        auto result = std::make_unique<caps_encoder_handle>();
++        result->ctx = ctx.release();
++        result->threads = threads;
++        LOG_INF("caps_encoder: ABI=1 b9090 qwen3a graph backport; F16 boundary; backend=%s threads=%d\n", ggml_backend_name(result->ctx->backend), threads);
++        return result.release();
++    } catch (const std::exception & e) {
++        caps_encoder_error = e.what();
++        return nullptr;
++    }
++}
++int32_t caps_ggml_encoder_dimension(void * handle) {
++    if (!handle) return 0;
++    return clip_n_mmproj_embd(static_cast<caps_encoder_handle *>(handle)->ctx);
++}
++const char * caps_ggml_encoder_backend_name(void * handle) {
++    if (!handle) return "";
++    return ggml_backend_name(static_cast<caps_encoder_handle *>(handle)->ctx->backend);
++}
++int32_t caps_ggml_encoder_stats(void * handle, uint64_t * gpu_nodes, uint64_t * cpu_nodes, uint64_t * total_nodes) {
++    if (!handle || !gpu_nodes || !cpu_nodes || !total_nodes) return -1;
++    auto ctx = static_cast<caps_encoder_handle *>(handle)->ctx;
++    *gpu_nodes = ctx->caps_gpu_nodes;
++    *cpu_nodes = ctx->caps_cpu_nodes;
++    *total_nodes = ctx->caps_total_nodes;
++    return 0;
++}
++int32_t caps_ggml_encoder_stats_detail(void * handle, uint64_t * gpu_core, uint64_t * cpu_core, uint64_t * gpu_metadata, uint64_t * cpu_metadata, uint64_t * unknown) {
++    if (!handle || !gpu_core || !cpu_core || !gpu_metadata || !cpu_metadata || !unknown) return -1;
++    auto ctx = static_cast<caps_encoder_handle *>(handle)->ctx;
++    *gpu_core = ctx->caps_gpu_core_nodes; *cpu_core = ctx->caps_cpu_core_nodes;
++    *gpu_metadata = ctx->caps_gpu_metadata_nodes; *cpu_metadata = ctx->caps_cpu_metadata_nodes;
++    *unknown = ctx->caps_unknown_nodes;
++    return 0;
++}
++int32_t caps_ggml_encoder_encode(void * handle, const float * mel, size_t frames, size_t valid_rows, float * out, size_t capacity_floats) {
++    caps_encoder_error.clear();
++    try {
++        if (!handle || !mel || !out || !frames || frames > (size_t)INT_MAX - 99) throw std::runtime_error("invalid encoder input");
++        if (valid_rows != caps_ggml_encoder_output_rows(frames)) throw std::runtime_error("valid_rows differs from existing output_length");
++        auto enc = static_cast<caps_encoder_handle *>(handle);
++        int dim = clip_n_mmproj_embd(enc->ctx);
++        if (dim <= 0 || valid_rows > std::numeric_limits<size_t>::max() / (size_t)dim || capacity_floats < valid_rows * (size_t)dim) {
++            throw std::runtime_error("output capacity too small");
++        }
++        const size_t padded = ((frames + 99) / 100) * 100;
++        if (padded > std::numeric_limits<size_t>::max() / 128 || valid_rows > (size_t)INT_MAX) throw std::runtime_error("encoder shape overflow");
++        clip_image_f32_batch batch;
++        batch.is_audio = true;
++        auto image = clip_image_f32_ptr(clip_image_f32_init());
++        image->nx = (int)padded;
++        image->ny = 128;
++        image->caps_valid_rows = (int)valid_rows;
++        image->buf.assign(128 * padded, 0.0f);
++        for (size_t band = 0; band < 128; ++band) {
++            std::copy(mel + band * frames, mel + (band + 1) * frames, image->buf.begin() + band * padded);
++        }
++        batch.entries.push_back(std::move(image));
++        if (!clip_image_batch_encode(enc->ctx, enc->threads, &batch, out)) throw std::runtime_error("ggml encoder failed; see native log");
++        return 0;
++    } catch (const std::exception & e) {
++        caps_encoder_error = e.what();
++        return -1;
++    }
++}
++void caps_ggml_encoder_free(void * handle) {
++    if (!handle) return;
++    auto enc = static_cast<caps_encoder_handle *>(handle);
++    clip_free(enc->ctx);
++    delete enc;
++}
+--- a/tools/mtmd/models/qwen3a.cpp
++++ b/tools/mtmd/models/qwen3a.cpp
+@@ -1,68 +1,98 @@
+ #include "models.h"
+ 
+ ggml_cgraph * clip_graph_qwen3a::build() {
++    // Ref implementation: https://github.com/QwenLM/Qwen3-ASR/blob/main/qwen_asr/core/transformers_backend/modeling_qwen3_asr.py
++
++    // inp_raw: [n_frames, n_mel, 1]  (nx=n_frames, ny=n_mel)
+     ggml_tensor * inp = build_inp_raw(1);
+ 
+-    // conv2d block
+-    // TODO: do we need to split by chunks of n_window each like on transformers impl?
++    const int64_t n_frames   = inp->ne[0]; // total frames, padded to multiple of chunk_size
++    const int64_t n_mel      = inp->ne[1]; // 128
++    const int64_t chunk_size = 100;        // n_window * 2 (n_window=50 from model config)
++    const int64_t n_chunks   = n_frames / chunk_size;
++
++    GGML_ASSERT(n_frames % chunk_size == 0); // preprocessor should already pad the input
++    GGML_ASSERT(inp->type == GGML_TYPE_F32);
++
++    // View mel spectrogram as batched 100-frame chunks: [chunk_size, n_mel, 1, n_chunks]
++    inp = ggml_view_4d(ctx0, inp,
++        chunk_size, n_mel, 1, n_chunks,
++        n_frames   * (int64_t)sizeof(float), // nb[1]: stride over mel bins
++        chunk_size * (int64_t)sizeof(float), // nb[2]: stride for C=1 (unused)
++        chunk_size * (int64_t)sizeof(float), // nb[3]: stride over chunks
++        0);
++    inp = ggml_cont(ctx0, inp);
++    cb(inp, "inp_chunks", -1);
++
++    // 3 x conv2d + gelu
+     {
+-        inp = ggml_conv_2d(ctx0, model.conv2d_1_w, inp, 2, 2, 1, 1, 1, 1);
+-        inp = ggml_add(ctx0, inp, model.conv2d_1_b);
+-        inp = ggml_gelu_erf(ctx0, inp);
++        // conv output [OW, OH, C_out, n_chunks]
++        auto conv_block = [&](ggml_tensor * x, ggml_tensor * w, ggml_tensor * b) {
++            x = ggml_conv_2d(ctx0, w, x, 2, 2, 1, 1, 1, 1);
++            if (b) {
++                x = ggml_add(ctx0, x, ggml_reshape_4d(ctx0, ggml_cast(ctx0, b, GGML_TYPE_F32), 1, 1, x->ne[2], 1));
++            }
++            return ggml_gelu_erf(ctx0, x);
++        };
+ 
+-        inp = ggml_conv_2d(ctx0, model.conv2d_2_w, inp, 2, 2, 1, 1, 1, 1);
+-        inp = ggml_add(ctx0, inp, model.conv2d_2_b);
+-        inp = ggml_gelu_erf(ctx0, inp);
+-
+-        inp = ggml_conv_2d(ctx0, model.conv2d_3_w, inp, 2, 2, 1, 1, 1, 1);
+-        inp = ggml_add(ctx0, inp, model.conv2d_3_b);
+-        inp = ggml_gelu_erf(ctx0, inp);
+-
+-        // inp [n_pos, n_mels/8, channels, 1] (W, H, C, N)
++        inp = conv_block(inp, model.conv2d_1_w, model.conv2d_1_b);
++        inp = conv_block(inp, model.conv2d_2_w, model.conv2d_2_b);
++        inp = conv_block(inp, model.conv2d_3_w, model.conv2d_3_b);
++        // inp: [OW=13, OH=16, OC=480, n_chunks]
+         cb(inp, "after_conv_blocks", -1);
+-
+-        const int64_t n_pos_after_conv = inp->ne[0];
+-        const int64_t n_mel_after_conv = inp->ne[1]; // 128/8 = 16
+-
+-        inp = ggml_cont(ctx0, ggml_permute(ctx0, inp, 0, 2, 3, 1));
+-        inp = ggml_reshape_2d(ctx0, inp, n_pos_after_conv, n_mel_after_conv * inp->ne[3]); // [n_pos, 7680]
+-        inp = ggml_cont(ctx0, ggml_transpose(ctx0, inp)); // [7680, n_pos]
+-
+-        // project to n_embd
+-        inp = ggml_mul_mat(ctx0, model.conv_out_w, inp);
+-        if (model.conv_out_b) {
+-            inp = ggml_add(ctx0, inp, model.conv_out_b);
+-        }
+-        cb(inp, "after_conv_out", -1);
+     }
+ 
+-    auto n_pos = inp->ne[1];
++    // permute [OW=25, OH=16, OC=480, n_chunks] -> [OH=16, OC=480, OW=25, n_chunks]
++    // reshape to [OH*OC=7680, OW*n_chunks]
++    // feature index h+16*c = c*16+f (matches python code)
++    inp = ggml_cont(ctx0, ggml_permute(ctx0, inp, 2, 0, 1, 3));
++    inp = ggml_reshape_2d(ctx0, inp, inp->ne[0] * inp->ne[1], inp->ne[2] * inp->ne[3]);
+ 
+-    ggml_tensor * pos_embd_selected = ggml_view_2d(
+-        ctx0, model.position_embeddings,
+-        model.position_embeddings->ne[0], n_pos,
+-        model.position_embeddings->nb[1], 0
+-    );
+-    ggml_tensor * cur = build_vit(
+-                            inp, n_pos,
+-                            NORM_TYPE_NORMAL,
+-                            hparams.ffn_op,
+-                            pos_embd_selected,
+-                            nullptr);
++    // Project to d_model: [d_model, 25*n_chunks]
++    inp = ggml_mul_mat(ctx0, model.conv_out_w, inp);
++    if (model.conv_out_b) {
++        inp = ggml_add(ctx0, inp, model.conv_out_b);
++    }
++    cb(inp, "after_conv_out", -1);
+ 
++    const int64_t n_pos = inp->ne[1]; // 25 * n_chunks
++
++    // Per-chunk positional embeddings: repeat pos[0:13] for each chunk
++    // (position indices reset 0..12 per chunk, not sequential across chunks)
++    {
++        const int64_t tokens_per_chunk = n_pos / n_chunks; // 13
++        ggml_tensor * pos_tmp = ggml_view_2d(ctx0, model.position_embeddings,
++            model.position_embeddings->ne[0], tokens_per_chunk,
++            model.position_embeddings->nb[1], 0);
++        ggml_tensor * tgt = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32,
++            model.position_embeddings->ne[0], n_pos);
++        inp = ggml_add(ctx0, inp, ggml_repeat(ctx0, ggml_cast(ctx0, pos_tmp, GGML_TYPE_F32), tgt));
++    }
++
++    // Existing ORT FE output and BE input are F16. Keep that boundary;
++    // internal ggml floating arithmetic still requires numerical comparison.
++    if (img.caps_valid_rows > 0) {
++        GGML_ASSERT(img.caps_valid_rows <= n_pos);
++        inp = ggml_cont(ctx0, ggml_view_2d(ctx0, inp, inp->ne[0],
++            img.caps_valid_rows, inp->nb[1], 0));
++        inp = ggml_cast(ctx0, ggml_cast(ctx0, inp, GGML_TYPE_F16), GGML_TYPE_F32);
++    }
++    const int64_t effective_pos = img.caps_valid_rows > 0 ? img.caps_valid_rows : n_pos;
++
++    ggml_tensor * cur = build_vit(inp, effective_pos,
++        NORM_TYPE_NORMAL, hparams.ffn_op,
++        nullptr,  // pos embd already added above
++        nullptr);
+     cb(cur, "after_transformer", -1);
+ 
+-    // projector
++    // MLP projector
+     cur = build_ffn(cur,
+         model.mm_1_w, model.mm_1_b,
+         nullptr, nullptr,
+         model.mm_2_w, model.mm_2_b,
+-        FFN_GELU_ERF,
+-        -1);
+-
++        FFN_GELU_ERF, -1);
+     cb(cur, "projected", -1);
+ 
+     ggml_build_forward_expand(gf, cur);
+-
+     return gf;
+ }
+--- /dev/null
++++ b/tools/mtmd/caps-encoder.h
+@@ -0,0 +1,24 @@
++#pragma once
++#include <stddef.h>
++#include <stdint.h>
++#if defined(_WIN32)
++#define CAPS_ENCODER_API __declspec(dllexport)
++#else
++#define CAPS_ENCODER_API __attribute__((visibility("default")))
++#endif
++#ifdef __cplusplus
++extern "C" {
++#endif
++CAPS_ENCODER_API uint32_t caps_ggml_encoder_abi_version(void);
++CAPS_ENCODER_API void * caps_ggml_encoder_load(const char * mmproj, const char * device_name, int32_t threads, int32_t use_gpu);
++CAPS_ENCODER_API int32_t caps_ggml_encoder_dimension(void * handle);
++CAPS_ENCODER_API size_t caps_ggml_encoder_output_rows(size_t frames);
++CAPS_ENCODER_API int32_t caps_ggml_encoder_encode(void * handle, const float * mel, size_t frames, size_t valid_rows, float * out, size_t capacity_floats);
++CAPS_ENCODER_API const char * caps_ggml_encoder_backend_name(void * handle);
++CAPS_ENCODER_API const char * caps_ggml_encoder_last_error(void);
++CAPS_ENCODER_API int32_t caps_ggml_encoder_stats(void * handle, uint64_t * gpu_nodes, uint64_t * cpu_nodes, uint64_t * total_nodes);
++CAPS_ENCODER_API int32_t caps_ggml_encoder_stats_detail(void * handle, uint64_t * gpu_core, uint64_t * cpu_core, uint64_t * gpu_metadata, uint64_t * cpu_metadata, uint64_t * unknown);
++CAPS_ENCODER_API void caps_ggml_encoder_free(void * handle);
++#ifdef __cplusplus
++}
++#endif

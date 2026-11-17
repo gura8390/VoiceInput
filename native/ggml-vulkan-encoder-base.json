@@ -1,0 +1,19 @@
+{
+  "base": "b9090 / 5757c4dcb178a01c85234a6db7503b19c9598873 + aligner and ASR single-output overlays; no bounded-upload source overlay",
+  "required_sha256": {
+    "tools/mtmd/CMakeLists.txt": "e1ef9627ae700a10af084d704eeafa44bb115f4ea3d7b64214830654454c2cdb",
+    "tools/mtmd/clip.h": "a73ef0f6043925a61b58a1acab752ed97f711334761bef93d5cc0db01e2b404f",
+    "tools/mtmd/clip-impl.h": "3c7fd9e07614695def805fe093ecb491fc3056b802e7067124b936066eb664a1",
+    "tools/mtmd/clip.cpp": "75e3e7de36691f8076e48b8eada834b06837b85a7ed2bfe9fc15b9e1ec385ef8",
+    "tools/mtmd/models/qwen3a.cpp": "8c68ccf6a2c03da47686217f87e332d310c5d3a8c4409238916803bbee7f1f4d",
+    "include/llama.h": "be232db8123af43c15e433c22844558142d30c1dcbfb57ce9109f4ae8b3d75a0",
+    "src/llama-context.cpp": "953ea08e6364be8fdc24246e241e83d6f23581fe268dc4b3edd67355b96bb917",
+    "src/llama-context.h": "652562888be76b2da7a6c7e61109de46f4d4a68fdd5c24c6622ed944c052ef41",
+    "src/llama-graph.cpp": "99e6bb8304883ebacdd7ad47da5beb29ef343a3900f54f84e6f745234ae6e7a1",
+    "src/llama-model-loader.cpp": "e487eeb7849bcb5ff1be2c90c360cded0dad3af34b844150c711d6b779a8c4a6",
+    "src/llama-model.cpp": "9d69249996eb2d69ec52c50ff2e47f1e6286925bea7136c67bc378355fb67f1a",
+    "ggml/include/ggml.h": "e9dcbc46054d3dfcecdeb90504146c30e547d29da73ae9605ce40e907343627b",
+    "ggml/include/ggml-backend.h": "46254804b53be29fc7704048ddcc5597009e32d0efb77896da11980ad69d2069",
+    "ggml/src/ggml.c": "2c778ac04c302ae0ea42a92383eb1cee7963e1af85288cda220032b01b7e483d"
+  }
+}
