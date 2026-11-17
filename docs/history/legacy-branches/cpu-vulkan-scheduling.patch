@@ -1,0 +1,207 @@
+From 5d2c228d1e7237073d5af7541ca93bef8a75530f Mon Sep 17 00:00:00 2001
+From: gura8390 <157937931+gura8390@users.noreply.github.com>
+Date: Tue, 27 Oct 2026 17:06:10 +0800
+Subject: [PATCH] Record CPU and Vulkan scheduling experiments without changing
+ deployment
+
+---
+ README.md                                   |  8 ++++
+ native/README.md                            |  8 ++++
+ native/vulkan-fence-schedule-research.patch | 46 +++++++++++++++++++++
+ tools/bench_cuda_route.py                   | 27 ++++++++++++
+ tools/test_vulkan_schedule.py               | 23 +++++++++++
+ 5 files changed, 112 insertions(+)
+ create mode 100644 native/vulkan-fence-schedule-research.patch
+ create mode 100644 tools/test_vulkan_schedule.py
+
+diff --git a/README.md b/README.md
+index 322f184..8ca4236 100644
+--- a/README.md
++++ b/README.md
+@@ -76,6 +76,14 @@ Copy-Item '.\assets\text\rules_default.txt' '.\runtime\hot-rule.txt'
+ 
+ 编码减少 **9.94%**，完整响应减少 **5.60%**，CPU 时间减少 **7.18%**；代价是私有提交多 **33.59 MiB（2.78%）**。每组 117/117 次识别的五个结果字段与五个原始字段一致，完整浮点编码输出另做 SHA 回归。文件各 7 条结果及正式路径六个媒体导出哈希一致，真实 12/123 秒空闲卸载和重载通过。私有提交不等于物理 RAM，GPU 阶段读数也不是瞬时峰值；这些结果不代表所有硬件或未知录音的保证。
+ 
++## CPU 与 Vulkan 调度后续研究
++
++在 0.4.4 上继续测试了独立传输队列、同步提交、graphics queue、最终 fence 阻塞及缩短自旋。相同 39 条音频的交错复测未找到值得替换正式版的整体收益。CPU 双前端会话三轮中位累计编码从 8.3394 增至 8.6904 秒，峰值私有提交约多 49.36 MiB；四会话单轮更慢且占用更多，均未采用。
++
++缩短 Vulkan 最终 fence 轮询间隔的三轮对照中，生成子阶段约快 1.04%，完整请求累计中位却从 15.8835 到 15.9089 秒（约慢 0.16%，视为持平）。阻塞等待减少部分 CPU 等待开销，但完整请求变慢；独立传输队列、同步及 graphics queue 也没有整体优势。20 组完整听写共 780 次回归一致，另有 351 次完整编码输出 SHA 回归一致；固定 token 重放的 35 次内部重复保留相关性，不能视为 35 个独立实验。
++
++正式配置及运行库继续保留 0.4.4，以上实验没有新增部署收益。研究用 fence 补丁见 [原生说明](native/README.md)，不属于推荐运行依赖；`tools/bench_cuda_route.py --vulkan-schedule` 只改变测试子进程环境。SameAsRequested arena 和跨请求流水线仍有理论空间，尚未实测；当前预期收益与实现、资源和验收成本不相称，停止本轮研究不表示证明所有优化均已穷尽。
++
+ ## 上一轮 CUDA 技术路线对照
+ 
+ 独立 [0.4.3—CUDA 技术分支](https://github.com/gura8390/YuYbUuRu/tree/0.4.3%E2%80%94CUDA) 保留上一轮研究。本节数据来自该轮，尚未启用 0.4.4 前端 arena。当前主线默认 `gpu_backend=vulkan`，按名字选择 `Vulkan0`。可显式选择 `cuda` / `CUDA0`，但需另外准备匹配 b9090 的 CUDA 插件、CUDA 12.8 运行库和 cuBLAS/Lt；缺少设备或后端明确报错。
+diff --git a/native/README.md b/native/README.md
+index c3f7fe8..e627acb 100644
+--- a/native/README.md
++++ b/native/README.md
+@@ -87,6 +87,14 @@ Get-FileHash (Join-Path $taskVulkanBuild 'bin/ggml-vulkan.dll') -Algorithm SHA25
+ 
+ `settings.example.json` 的 `aligner_logits_limit=4000` 需要上述扩展。旧 DLL 缺少扩展时会明确失败。使用普通完整词表 DLL 时应设置 `aligner_logits_limit=0` 和 `asr_single_output=false`；`aligner_dynamic_context=false` 与 `file_context_handoff=false` 可恢复原固定上下文及保留策略。本分支应用 Settings 缺字段时采用 `true/4000/true` 的对齐优化默认值；底层 EngineOptions 仍保留旧诊断接口默认值。
+ 
++## 调度实验补丁（未部署）
++
++`vulkan-fence-schedule-research.patch` 在同一 b9090 持久缓存源码上提供诊断和最终 fence 等待对照。先应用本目录已有缓存补丁，再用 `git apply --check` 检查该研究补丁；仅替换实验目录中的 `ggml-vulkan.dll`。它不改变 shader、模型或浮点算式，默认保留原有 1000 次 pause 的轮询路径。
++
++存在 `GGML_VK_FENCE_WAIT_BLOCKING` 时改为阻塞等待；存在 `GGML_VK_FENCE_SHORT_SPIN` 时每轮只 pause 10 次；两者同时存在则阻塞优先。变量判断存在性，设置 `0` 仍会启用。队列诊断输出实际 async、队列 family 和 transfer 状态。`tools/bench_cuda_route.py --vulkan-schedule` 在自有测试进程内清理互斥候选的继承值并记录环境，不修改系统或正式配置；blocking/short-spin 需要此研究 DLL，其他三种队列开关由 b9090 原生支持。
++
++本机复测没有获得值得部署的整体收益，正式 0.4.4 **不应用此补丁**。固定 token 的 GPU 等待开销、完整听写耗时和 CPU 时间必须分别比较；少量内部重复不构成跨进程统计结论。
++
+ ## 许可
+ 
+ llama.cpp 保留 **The ggml authors** 的 MIT 版权，原许可全文见 [llama.cpp-LICENSE](llama.cpp-LICENSE)。两个补丁沿用 MIT 许可；发布或再分发构建结果时须携带原作者版权及许可。原模型、后端、驱动和其它运行依赖继续适用各自许可。
+diff --git a/native/vulkan-fence-schedule-research.patch b/native/vulkan-fence-schedule-research.patch
+new file mode 100644
+index 0000000..6188d4b
+--- /dev/null
++++ b/native/vulkan-fence-schedule-research.patch
+@@ -0,0 +1,46 @@
++--- a/ggml/src/ggml-vulkan/ggml-vulkan.cpp
+++++ b/ggml/src/ggml-vulkan/ggml-vulkan.cpp
++@@ -2110,6 +2110,19 @@
++         ctx->almost_ready_fence_pending = false;
++     }
++ 
+++    // Research-only policy: preserve queue order and both fence resets.
+++    static const bool short_final_spin = std::getenv("GGML_VK_FENCE_SHORT_SPIN") != nullptr;
+++    static const bool blocking_final_fence = []() {
+++        const bool enabled = std::getenv("GGML_VK_FENCE_WAIT_BLOCKING") != nullptr;
+++        fprintf(stderr, "ggml_vulkan: final fence wait policy = %s\n", enabled ? "blocking" : (std::getenv("GGML_VK_FENCE_SHORT_SPIN") != nullptr ? "short-spin" : "spin"));
+++        return enabled;
+++    }();
+++    if (blocking_final_fence) {
+++        VK_CHECK(ctx->device->device.waitForFences({ ctx->fence }, true, UINT64_MAX), "final_fence_blocking");
+++        ctx->device->device.resetFences({ ctx->fence });
+++        return;
+++    }
+++
++     // Spin (w/pause) waiting for the graph to finish executing.
++     vk::Result result;
++     while ((result = ctx->device->device.getFenceStatus(ctx->fence)) != vk::Result::eSuccess) {
++@@ -2117,7 +2130,7 @@
++             fprintf(stderr, "ggml_vulkan: error %s at %s:%d\n", to_string(result).c_str(), __FILE__, __LINE__);
++             exit(1);
++         }
++-        for (uint32_t i = 0; i < 100; ++i) {
+++        for (uint32_t i = 0; i < (short_final_spin ? 1u : 100u); ++i) {
++             YIELD();
++             YIELD();
++             YIELD();
++@@ -5706,6 +5719,14 @@
++         } else if (getenv("GGML_VK_FORCE_MMVQ")) {
++             device->mmvq_mode = 1;
++         }
+++
+++        // Research-only: report actual initialized queue policy once per device.
+++        fprintf(stderr, "YYUR_VULKAN_QUEUE {\"async\":%s,\"single_queue\":%s,\"async_use_transfer_queue\":%s,\"compute_queue_family_index\":%u,\"transfer_queue_family_index\":%u,\"allow_graphics_queue\":%s}\n",
+++                device->support_async ? "true" : "false",
+++                device->single_queue ? "true" : "false",
+++                device->async_use_transfer_queue ? "true" : "false",
+++                compute_queue_family_index, transfer_queue_family_index,
+++                allow_graphics_queue ? "true" : "false");
++ 
++         return device;
++     }
+diff --git a/tools/bench_cuda_route.py b/tools/bench_cuda_route.py
+index ba85384..bc430fe 100644
+--- a/tools/bench_cuda_route.py
++++ b/tools/bench_cuda_route.py
+@@ -20,6 +20,24 @@ from cuda_metrics import Collector
+ ROOT = Path(__file__).resolve().parents[1]
+ 
+ MEMORY_FIELDS = ('private_bytes', 'private_working_set', 'working_set')
++VULKAN_SCHEDULE_KEYS = ('GGML_VK_ASYNC_USE_TRANSFER_QUEUE', 'GGML_VK_DISABLE_ASYNC',
++                        'GGML_VK_ALLOW_GRAPHICS_QUEUE', 'GGML_VK_FENCE_WAIT_BLOCKING',
++                        'GGML_VK_FENCE_SHORT_SPIN')
++VULKAN_SCHEDULES = {'control': None, 'transfer': VULKAN_SCHEDULE_KEYS[0],
++                    'sync': VULKAN_SCHEDULE_KEYS[1], 'graphics': VULKAN_SCHEDULE_KEYS[2],
++                    'blocking': VULKAN_SCHEDULE_KEYS[3], 'short-spin': VULKAN_SCHEDULE_KEYS[4]}
++
++
++def configure_vulkan_schedule(env, candidate):
++    """Change only an owned child's environment; presence, not '0', enables VK flags."""
++    if candidate not in VULKAN_SCHEDULES:
++        raise ValueError('Unknown Vulkan scheduling candidate')
++    result = dict(env)
++    for key in VULKAN_SCHEDULE_KEYS:
++        result.pop(key, None)
++    if VULKAN_SCHEDULES[candidate]:
++        result[VULKAN_SCHEDULES[candidate]] = '1'
++    return result
+ 
+ 
+ def _number(value):
+@@ -69,6 +87,8 @@ def main():
+     parser.add_argument('--mode', choices=['asr', 'file'], default='asr')
+     parser.add_argument('--match', choices=['exact', 'compare'], default='exact')
+     parser.add_argument('--first', type=int, help='Optional prefix for diagnostic screening only')
++    parser.add_argument('--vulkan-schedule', choices=VULKAN_SCHEDULES,
++                        help='Isolated scheduling experiment; leaves product settings unchanged')
+     args = parser.parse_args()
+     args.output = args.output.resolve()
+     if not args.output.is_relative_to((ROOT / 'evidence').resolve()):
+@@ -91,16 +111,22 @@ def main():
+         assert sha(Path(by_id[s['id']]['pcm'])) == s['pcm_sha256']
+     settings_path = args.app_dir / 'settings.json'
+     settings = json.loads(settings_path.read_text('utf-8'))
++    if args.vulkan_schedule is not None and settings['gpu_backend'] != 'vulkan':
++        parser.error('Vulkan scheduling experiments require a Vulkan app configuration')
+     expected_backend = 'CUDA0' if settings['gpu_backend'] == 'cuda' else 'Vulkan0'
+     args.output.parent.mkdir(parents=True, exist_ok=True)
+     log_dir = args.output.with_suffix('.logs')
+     env = os.environ.copy(); env['YYUR_LOG_DIR'] = str(log_dir.resolve())
++    if args.vulkan_schedule is not None:
++        env = configure_vulkan_schedule(env, args.vulkan_schedule)
+     for key in ('GGML_BACKEND_PATH', 'YYUR_PROFILE_LOAD', 'VK_INSTANCE_LAYERS', 'VK_LAYER_PATH'):
+         env.pop(key, None)
+     report = {'complete': False, 'execution_passed': False, 'passed': False,
+               'measurement_passed': False, 'gpu_measurement_passed': False,
+               'executable': str(args.exe), 'binary_sha256': sha(args.exe),
+               'settings': settings, 'settings_sha256': sha(settings_path),
++              'vulkan_schedule_candidate': args.vulkan_schedule,
++              'vulkan_schedule_environment': {key: env.get(key) for key in VULKAN_SCHEDULE_KEYS},
+               'reference_sha256': sha(args.reference), 'reference_original_passed': ref.get('passed'),
+               'match_policy': args.match, 'mode': args.mode, 'samples': [], 'stages': [],
+               'inherited_graph_environment': {key: env.get(key) for key in
+@@ -224,6 +250,7 @@ def main():
+             report['gpu_measurement_errors'].append('Collector cleanup failed')
+         report['gpu_measurement_passed'] = bool(report['stages']) and not report['gpu_measurement_errors']
+         report['passed'] = (report['execution_passed'] and report['measurement_passed']
++                            and (args.vulkan_schedule is None or report['gpu_measurement_passed'])
+                             and report['cleanup_confirmed'] and (args.match=='compare' or report.get('outputs_exact') is True))
+         report['elapsed_seconds'] = time.perf_counter()-started
+         args.output.write_text(json.dumps(report,ensure_ascii=False,indent=2), 'utf-8')
+diff --git a/tools/test_vulkan_schedule.py b/tools/test_vulkan_schedule.py
+new file mode 100644
+index 0000000..7c64041
+--- /dev/null
++++ b/tools/test_vulkan_schedule.py
+@@ -0,0 +1,23 @@
++"""Scheduling isolation guards; no hardware or user settings are accessed."""
++import unittest
++from bench_cuda_route import configure_vulkan_schedule, VULKAN_SCHEDULE_KEYS, VULKAN_SCHEDULES
++
++
++class ScheduleIsolationTests(unittest.TestCase):
++    def test_all_candidates_clear_presence_based_inherited_flags(self):
++        contaminated = {key: '0' for key in VULKAN_SCHEDULE_KEYS} | {'PATH': 'keep'}
++        for candidate, active in VULKAN_SCHEDULES.items():
++            with self.subTest(candidate=candidate):
++                actual = configure_vulkan_schedule(contaminated, candidate)
++                self.assertEqual({k: v for k, v in actual.items() if k != 'PATH'},
++                                 {active: '1'} if active else {})
++                self.assertEqual(actual['PATH'], 'keep')
++                self.assertTrue(all(contaminated[k] == '0' for k in VULKAN_SCHEDULE_KEYS))
++
++    def test_unknown_candidate_rejected(self):
++        with self.assertRaises(ValueError):
++            configure_vulkan_schedule({}, 'typo')
++
++
++if __name__ == '__main__':
++    unittest.main()
+-- 
+2.55.0.windows.2
+

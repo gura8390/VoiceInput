@@ -16,6 +16,8 @@ Windows x64 离线语音输入工具，当前版本 **0.6.0**。启动文件统�
 
 本轮采用 ONNX 外置权重，保留已有权重数值和计算图；按实际输入分配解码上下文，并让闲置清理覆盖连续请求场景。模型和当前配置的完整结果见 [持续内存优化报告](docs/memory-optimization.md)，历次测量见 [优化历史](docs/optimization-history.md)。
 
+三个旧开发分支的研究、未采用方案和源码附件已归入 [旧技术分支研究档案](docs/history/legacy-branches/README.md)。保留有效成果的主线历史，归档后清理旧分支名；程序与模型配置保持原样。
+
 ## 构建
 
 需要 Windows x64、Rust stable MSVC、C++ Build Tools 和 Windows SDK。

@@ -5,3 +5,7 @@
 native/*.patch -text whitespace=-blank-at-eol
 # Retain the verbatim SPIR-V license extraction, including its final blank line.
 assets/licenses/native/SPIRV-Headers-04f10f650d51-MIT.txt whitespace=-blank-at-eof
+
+# Preserve the archived, unadopted scheduling diff as documentary source.
+docs/history/legacy-branches/*.patch -text whitespace=-blank-at-eol,-blank-at-eof
+docs/history/legacy-branches/*-snapshot.txt -text whitespace=-blank-at-eol,-blank-at-eof
