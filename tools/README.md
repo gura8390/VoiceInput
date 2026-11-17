@@ -61,7 +61,13 @@ python tools/models/prepare_external_weights.py --source 输入目录/encoder.on
 | 隔离 CUDA 运行目录准备 | `stage_cuda_research.py` |
 | ORT CUDA 下载、依赖检查与准备 | `prepare_ort_cuda_runtime.py`、`prepare_ort_cuda_dependencies.py`、`inspect_ort_cuda_closure.py`、`stage_ort_cuda_encoder.py` |
 | ORT profile 汇总 | `summarize_ort_profile.py` |
+| GGML 编码器等值权重与隔离接入 | `prepare_ggml_encoder.py`、`stage_ggml_encoder_candidate.py`、`ggml_encoder_candidate.rs`、`ggml_route_config_tests.rs` |
+| GGML 原生构建、ABI 与浮点检查 | `build_ggml_encoder_poc.ps1`、`probe_ggml_encoder_abi.py`、`compare_ggml_embeddings.py` |
+| GGML Vulkan / CUDA 三版对照 | `stage_ggml_cuda_native.py`、`bench_ggml_three_routes.py`、`summarize_ggml_three_routes.py`、`quality_ggml_routes.py` |
+| GitHub 原 CUDA 分支与同模型路线对照 | `bench_historical_cuda_branch.py`、`bench_previous_cuda_route.py`、`summarize_cuda_controls.py`、`summarize_historical_cuda.py`、`verify_cuda_control_summaries.py` |
 
 研究工具现按 `config/` 和 `runtime/` 目录运行。CUDA 候选 ORT 使用独立的 `runtime/onnx-cuda/`，CPU ONNX 目录仍为 `runtime/onnx/`。已有旧版测量记录只作为历史证据；重新测量需准备符合当前布局的隔离运行目录、候选二进制和匹配参考，不能将旧记录路径当作当前默认路径。
 
 模型、私人音频、热词、转写结果、运行库与本机测量文件均不属于源码发布载荷。[优化历史](../docs/optimization-history.md) 记录采用或停止的技术路线。
+
+GGML 研究工具只把适配器放入指定的新 detached worktree，在本地 `evidence/` 中准备候选。正式程序保持原样。三版名称、同权重条件、采样口径和实际文件质量差异见 [三版报告](../docs/ggml-three-versions-comparison.md)；CUDA 原生载荷身份和重现方式见 [原生说明](../native/ggml-cuda-encoder.md)。

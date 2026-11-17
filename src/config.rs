@@ -56,6 +56,8 @@ pub enum EncoderProvider {
     Cpu,
     CudaBackend,
     CudaAll,
+    GgmlVulkan,
+    GgmlCuda,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -67,6 +69,7 @@ pub struct Settings {
     pub asr_model: AsrModel,
     pub onnx_dll: Option<PathBuf>,
     pub encoder_provider: EncoderProvider,
+    pub ggml_encoder_model: Option<PathBuf>,
     /// Per-session CUDA EP arena limit; excludes libraries and other sessions.
     pub encoder_cuda_mem_limit_mb: usize,
     /// None preserves the shared intra-op setting; Some(0) requests ORT auto.
@@ -116,6 +119,7 @@ impl Default for Settings {
             asr_model: AsrModel::default(),
             onnx_dll: None,
             encoder_provider: EncoderProvider::Cpu,
+            ggml_encoder_model: None,
             encoder_cuda_mem_limit_mb: 512,
             encoder_frontend_threads: None,
             encoder_frontend_arena: false,
@@ -201,6 +205,17 @@ impl Settings {
                     .is_some(),
             "Encoder CUDA arena limit must be a positive MiB value"
         );
+        if matches!(value.encoder_provider, EncoderProvider::GgmlVulkan | EncoderProvider::GgmlCuda) {
+            let expected = if value.encoder_provider == EncoderProvider::GgmlCuda { GpuBackend::Cuda } else { GpuBackend::Vulkan };
+            ensure!(value.gpu && value.gpu_backend == expected, "GGML 编解码器的 GPU 后端配置不一致");
+        }
+        if let Some(model) = value.ggml_encoder_model.as_ref() {
+            let resolved = if model.is_absolute() { model.clone() } else {
+                path.and_then(Path::parent).unwrap_or(&value.app_dir).join(model)
+            };
+            // Model existence is checked after CLI overrides by the selected engine.
+            value.ggml_encoder_model = Some(resolved);
+        }
         validate_encoder_cpu_tuning(
             value.encoder_frontend_threads,
             value.encoder_dynamic_block_base,

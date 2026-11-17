@@ -1,0 +1,9 @@
+{
+  "base": "First isolated GGML encoder candidate f4fa3516 DLL source; apply after ggml-vulkan-encoder.patch",
+  "required_sha256": {
+    "tools/mtmd/clip-impl.h": "373a8d930582f7cba0528b2b26fcdde806cc576f95179ca0a44683fa52857fda",
+    "tools/mtmd/clip.cpp": "3b02de3fcfbeda278a26486643c948c38479723dfca62f008576ddb4b3acd45b",
+    "tools/mtmd/models/qwen3a.cpp": "1037c0af62222e95efc4ccc2b27d310c3c5df05bad3657cac160b3ad68252970",
+    "tools/mtmd/caps-encoder.h": "12a4c06cb8e6b3923aeaa341294e6bf6c6c8226b56f2fe90f64274378bf0d34e"
+  }
+}

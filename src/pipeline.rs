@@ -21,6 +21,8 @@ pub fn engine_options(settings: &Settings) -> EngineOptions {
         asr_model: settings.asr_model,
         onnx_dll: settings.onnx_dll.clone(),
         encoder_provider: settings.encoder_provider,
+        ggml_encoder_model: settings.ggml_encoder_model.clone(),
+        llama_dir: Some(crate::paths::AppPaths::new(&settings.app_dir).llama()),
         encoder_cuda_mem_limit_mb: settings.encoder_cuda_mem_limit_mb,
         encoder_frontend_threads: settings.encoder_frontend_threads,
         encoder_frontend_arena: settings.encoder_frontend_arena,

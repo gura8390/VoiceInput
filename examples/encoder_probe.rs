@@ -10,7 +10,10 @@ use std::{
     path::{Path, PathBuf},
     time::Instant,
 };
-pub use yuybuuru::engine::{EncoderProvider, EngineOptions};
+pub use yuybuuru::engine::{EncoderProvider, EngineOptions, GpuBackend};
+#[path = "../src/engine/llama.rs"]
+#[allow(dead_code)]
+mod llama;
 fn load_timing(stage: &'static str, started: Instant) {
     if std::env::var_os("YYUR_PROFILE_LOAD").is_some() {
         eprintln!(
@@ -66,6 +69,8 @@ fn hash_file(path: &Path) -> Result<String> {
     Ok(format!("{:x}", digest.finalize()))
 }
 fn main() -> Result<()> {
+    ensure!(!matches!(std::env::var("YYUR_ENCODER_RESEARCH_PROVIDER").as_deref(), Ok("ggml_vulkan"|"ggml_cuda")),
+        "This CPU-only probe cannot label a GGML/Vulkan run; use bench_ggml_vulkan_encoder.py");
     let args = Args::parse();
     ensure!(
         !args.output.exists(),
