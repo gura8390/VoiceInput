@@ -14,6 +14,11 @@ pub enum Request {
     Warmup {
         id: u64,
     },
+    VadScan {
+        id: u64,
+        task_id: String,
+        is_final: bool,
+    },
     Segment {
         id: u64,
         task_id: String,
@@ -39,6 +44,7 @@ impl Request {
     pub fn id(&self) -> u64 {
         match self {
             Self::Warmup { id }
+            | Self::VadScan { id, .. }
             | Self::Segment { id, .. }
             | Self::DropSession { id, .. }
             | Self::Shutdown { id } => *id,

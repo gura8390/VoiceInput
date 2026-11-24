@@ -318,11 +318,13 @@ impl Engine {
         self.next_seeds = seeds.iter().copied().collect();
     }
 
-    /// Exercise the encoder and one decoder step with silence.
-    /// No hotwords or caller context are applied. Decoder state is cleared before return,
-    /// and sampler seeds are left untouched.
+    /// Exercise one short silent encoder chunk and one decoder step.
+    /// `Engine::load` already warms the encoder with two seconds of silence; this
+    /// warms the Vulkan decoder prefill/decode path without applying hotwords or
+    /// caller context. Decoder state is cleared before return and sampler seeds
+    /// are left untouched.
     pub fn warmup_pipelines(&mut self) -> Result<()> {
-        let silence = vec![0.0f32; 32_000];
+        let silence = vec![0.0f32; 16_000];
         let feature = self.encoder.encode(&silence)?;
         ensure!(
             feature.dim == self.model.dim,
@@ -352,7 +354,8 @@ impl Engine {
                 .context("ASR context was not initialized")?;
             ctx.clear()?;
             ctx.prefill(&full, n, self.model.dim, &[])?;
-            let _ = ctx.decode_token(self.model.eos)?;
+            let status = ctx.decode_token(self.model.eos)?;
+            ensure!(status == 0, "ASR 预热解码返回异常状态 {status}");
             Ok(())
         })();
         if let Some(ctx) = self.ctx.as_mut() {

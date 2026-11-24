@@ -2,7 +2,7 @@ use crate::{
     config::Settings,
     desktop::{self, DesktopEvent, DesktopOutput},
     media,
-    models::{self, Decision, Silero},
+    models::{self, Decision, SpeechSpan},
     pipeline::{AudioSegment, SegmentBuffer, now},
     protocol::{Recognition, Request},
     random::SamplerSeeds,
@@ -273,6 +273,70 @@ impl RuntimeClient {
         )?;
         Ok((transcript, files))
     }
+    pub fn vad_filter(&self, task_id: &str, audio: &[f32]) -> Result<Decision> {
+        if audio.is_empty() {
+            return Ok(Decision::Drop);
+        }
+        const VAD_CHUNK_SAMPLES: usize = 60 * 16_000;
+        let total = audio.len();
+        let mut offset = 0usize;
+        let mut span = SpeechSpan::default();
+        while offset < total {
+            let end = (offset + VAD_CHUNK_SAMPLES).min(total);
+            let is_final = end == total;
+            let reply = self.worker.call(
+                Request::VadScan {
+                    id: next_id(),
+                    task_id: task_id.into(),
+                    is_final,
+                },
+                audio[offset..end].to_vec(),
+            );
+            let reply = match reply {
+                Ok(reply) => reply,
+                Err(error) => {
+                    let _ = self.worker.submit(
+                        Request::DropSession {
+                            id: next_id(),
+                            task_id: task_id.into(),
+                        },
+                        Vec::new(),
+                    );
+                    return Err(error);
+                }
+            };
+            if is_final {
+                let metrics = &reply.metrics;
+                span = SpeechSpan {
+                    speech_samples: metrics
+                        .get("speech_samples")
+                        .and_then(|v| v.as_u64())
+                        .context("VAD 缺少 speech_samples")?
+                        as usize,
+                    first: metrics
+                        .get("first")
+                        .and_then(|v| v.as_u64())
+                        .map(|v| v as usize),
+                    last: metrics
+                        .get("last")
+                        .and_then(|v| v.as_u64())
+                        .context("VAD 缺少 last")? as usize,
+                    total_samples: metrics
+                        .get("total_samples")
+                        .and_then(|v| v.as_u64())
+                        .unwrap_or(total as u64) as usize,
+                };
+            }
+            offset = end;
+        }
+        match span.resolve_bounds(
+            self.settings.vad_min_speech_ms,
+            self.settings.vad_speech_pad_ms,
+        ) {
+            Some((start, end)) => Ok(Decision::Keep(audio[start..end.min(audio.len())].to_vec())),
+            None => Ok(Decision::Drop),
+        }
+    }
 }
 
 struct MicSession {
@@ -285,7 +349,6 @@ struct MicSession {
 fn finish_dictation(
     client: &RuntimeClient,
     output: &mpsc::Sender<DesktopOutput>,
-    silero: &mut Option<Silero>,
     live: MicSession,
 ) -> Result<()> {
     let MicSession {
@@ -295,20 +358,22 @@ fn finish_dictation(
         held,
     } = live;
     if let Some(audio) = held {
-        match models::classify(silero, &client.settings, &audio)? {
+        match client.vad_filter(&id, &audio)? {
             Decision::Drop => {
                 let _ = output.send(DesktopOutput::State("未检测到语音".into()));
                 let _ = output.send(DesktopOutput::State("离线听写已就绪".into()));
                 return Ok(());
             }
             Decision::Keep(trimmed) => {
+                let _ = output.send(DesktopOutput::State("正在识别".into()));
                 for part in cache.append(&trimmed) {
                     client.segment(&id, "mic", part, started)?;
                 }
             }
         }
+    } else {
+        let _ = output.send(DesktopOutput::State("正在识别".into()));
     }
-    let _ = output.send(DesktopOutput::State("正在识别".into()));
     let result = client.segment(&id, "mic", cache.finish(), started)?;
     let force = desktop::foreground_process_name().eq_ignore_ascii_case("weixin.exe");
     let text = client.text.lock().unwrap().mic(&result.text, force)?;
@@ -364,7 +429,6 @@ pub fn desktop(settings: Settings, seed: Option<u32>, passive: bool) -> Result<(
         .name("desktop-dispatch".into())
         .spawn(move || {
             let mut session: Option<MicSession> = None;
-            let mut silero: Option<Silero> = None;
             while let Ok(event) = events_rx.recv() {
                 let quitting = matches!(event, DesktopEvent::Quit);
                 let voice_event = matches!(
@@ -386,7 +450,9 @@ pub fn desktop(settings: Settings, seed: Option<u32>, passive: bool) -> Result<(
                                 ),
                                 held: dispatch_client.settings.vad.then(Vec::new),
                             });
-                            dispatch_client.warmup()?;
+                            if !dispatch_client.settings.vad {
+                                dispatch_client.warmup()?;
+                            }
                             let _ = dispatch_output.send(DesktopOutput::State("正在听写".into()));
                         }
                         DesktopEvent::Audio(audio) => {
@@ -412,12 +478,7 @@ pub fn desktop(settings: Settings, seed: Option<u32>, passive: bool) -> Result<(
                         }
                         DesktopEvent::Stop => {
                             if let Some(live) = session.take() {
-                                finish_dictation(
-                                    &dispatch_client,
-                                    &dispatch_output,
-                                    &mut silero,
-                                    live,
-                                )?;
+                                finish_dictation(&dispatch_client, &dispatch_output, live)?;
                             }
                         }
                         DesktopEvent::DownloadModels => {

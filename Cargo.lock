@@ -1277,6 +1277,7 @@ dependencies = [
  "half",
  "libloading 0.8.9",
  "memmap2",
+ "native-tls",
  "ort",
  "regex",
  "rustfft",

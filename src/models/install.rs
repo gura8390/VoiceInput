@@ -115,6 +115,20 @@ fn ensure_package(
             replace_file(&source, &dest)?;
         }
     }
+    // Remove temporary zip archives and staging files once every target file is verified in place.
+    if package.kind == PackageKind::Zip {
+        if let Some(archive_path) = archive.as_deref() {
+            let _ = fs::remove_file(archive_path);
+        }
+        let staging_dir = app.join("cache/downloads/staging").join(package.id);
+        if staging_dir.exists() {
+            let _ = fs::remove_dir_all(&staging_dir);
+        }
+        let prepare_dir = app.join("cache/prepare").join(package.id);
+        if prepare_dir.exists() {
+            let _ = fs::remove_dir(&prepare_dir);
+        }
+    }
     Ok(())
 }
 

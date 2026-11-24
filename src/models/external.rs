@@ -1014,7 +1014,8 @@ mod tests {
         );
         let script = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .join("tools/models/prepare_external_weights.py");
-        let status = std::process::Command::new("python3")
+        let mut cmd = find_python_command();
+        let status = cmd
             .arg(&script)
             .arg("--source")
             .arg(&source)
@@ -1029,7 +1030,7 @@ mod tests {
             .arg("--expected-source-sha256")
             .arg(sha256_file(&source).unwrap())
             .status()
-            .expect("python3");
+            .expect("python");
         assert!(status.success(), "python prepare failed");
         assert_eq!(
             fs::read(rust_root.join("model.onnx")).unwrap(),
@@ -1125,5 +1126,28 @@ mod tests {
             );
         }
         let _ = fs::remove_dir_all(root);
+    }
+
+    fn find_python_command() -> std::process::Command {
+        let candidates: &[(&str, &[&str])] = if cfg!(windows) {
+            &[("python", &[]), ("py", &["-3"]), ("python3", &[])]
+        } else {
+            &[("python3", &[]), ("python", &[])]
+        };
+        for (exe, prefix) in candidates {
+            let ok = std::process::Command::new(exe)
+                .args(*prefix)
+                .arg("--version")
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status()
+                .is_ok_and(|s| s.success());
+            if ok {
+                let mut cmd = std::process::Command::new(exe);
+                cmd.args(*prefix);
+                return cmd;
+            }
+        }
+        panic!("no working Python 3 executable found in PATH");
     }
 }

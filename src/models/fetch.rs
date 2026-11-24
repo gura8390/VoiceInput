@@ -93,11 +93,7 @@ fn download_once(
     if have == expected_size {
         return finish_partial(partial, expected_size, expected_sha256);
     }
-    let agent = ureq::AgentBuilder::new()
-        .timeout_connect(Duration::from_secs(30))
-        .timeout_read(Duration::from_secs(120))
-        .redirects(0)
-        .build();
+    let agent = build_agent(url)?;
     let (status, mut reader, total) = open_with_redirects(&agent, url, have, expected_size)?;
     if status == 200 && have != 0 {
         have = 0;
@@ -134,16 +130,226 @@ fn download_once(
         if written == expected_size
             || written / (8 * 1024 * 1024) != (written - n as u64) / (8 * 1024 * 1024)
         {
-            progress(&format!("已下载 {written} / {expected_size} 字节"));
+            progress(&format_progress(written, expected_size));
         }
     }
     file.flush()?;
     drop(file);
     ensure!(
         written == expected_size,
-        "下载不完整：{written}/{expected_size} 字节"
+        "下载不完整：{}",
+        format_progress(written, expected_size)
     );
     finish_partial(partial, expected_size, expected_sha256)
+}
+
+fn format_progress(written: u64, expected: u64) -> String {
+    let pct = if expected == 0 {
+        100.0
+    } else {
+        (written as f64 / expected as f64 * 100.0).min(100.0)
+    };
+    if expected >= 1024 * 1024 {
+        format!(
+            "已下载 {:.1} / {:.1} MiB ({:.0}%)",
+            written as f64 / (1024.0 * 1024.0),
+            expected as f64 / (1024.0 * 1024.0),
+            pct
+        )
+    } else {
+        format!(
+            "已下载 {:.1} / {:.1} KiB ({:.0}%)",
+            written as f64 / 1024.0,
+            expected as f64 / 1024.0,
+            pct
+        )
+    }
+}
+
+fn build_agent(url: &str) -> Result<ureq::Agent> {
+    let tls = native_tls::TlsConnector::new().context("初始化系统 TLS 失败")?;
+    let mut builder = ureq::AgentBuilder::new()
+        .tls_connector(std::sync::Arc::new(tls))
+        .timeout_connect(Duration::from_secs(30))
+        .timeout_read(Duration::from_secs(120))
+        .redirects(0)
+        .try_proxy_from_env(true);
+    if !has_env_proxy() && !is_loopback_url(url) {
+        if let Some(proxy_url) = system_proxy_for_url(url) {
+            if let Ok(proxy) = ureq::Proxy::new(&proxy_url) {
+                builder = builder.proxy(proxy);
+            }
+        }
+    }
+    Ok(builder.build())
+}
+
+fn has_env_proxy() -> bool {
+    [
+        "HTTPS_PROXY",
+        "https_proxy",
+        "HTTP_PROXY",
+        "http_proxy",
+        "ALL_PROXY",
+        "all_proxy",
+    ]
+    .iter()
+    .any(|name| std::env::var(name).is_ok_and(|value| !value.trim().is_empty()))
+}
+
+fn extract_host(url: &str) -> Option<&str> {
+    let (_, rest) = url.split_once("://")?;
+    let authority = rest.split('/').next()?;
+    let host_port = authority.rsplit('@').next()?;
+    if let Some(bracketed) = host_port.strip_prefix('[') {
+        bracketed.split(']').next()
+    } else {
+        host_port.split(':').next()
+    }
+}
+
+fn is_loopback_url(url: &str) -> bool {
+    let Some(host) = extract_host(url) else {
+        return false;
+    };
+    host.eq_ignore_ascii_case("localhost") || host == "127.0.0.1" || host == "::1"
+}
+
+fn select_windows_proxy(proxy_server: &str, proxy_override: Option<&str>, url: &str) -> Option<String> {
+    let raw = proxy_server.trim();
+    if raw.is_empty() {
+        return None;
+    }
+    let host = extract_host(url).unwrap_or("");
+    if let Some(overrides) = proxy_override {
+        for rule in overrides.split(';').map(str::trim).filter(|s| !s.is_empty()) {
+            if rule.eq_ignore_ascii_case("<local>") && !host.contains('.') {
+                return None;
+            }
+            if wildcard_match(rule, host) {
+                return None;
+            }
+        }
+    }
+    let scheme = url.split_once("://").map(|(s, _)| s).unwrap_or("https");
+    let chosen = if raw.contains('=') {
+        let mut by_scheme = None;
+        let mut fallback = None;
+        for entry in raw.split(';').map(str::trim).filter(|s| !s.is_empty()) {
+            if let Some((k, v)) = entry.split_once('=') {
+                let k = k.trim();
+                let v = v.trim();
+                if v.is_empty() {
+                    continue;
+                }
+                if k.eq_ignore_ascii_case(scheme) {
+                    by_scheme = Some(v);
+                } else if fallback.is_none() && (k.eq_ignore_ascii_case("http") || k.eq_ignore_ascii_case("https")) {
+                    fallback = Some(v);
+                }
+            }
+        }
+        by_scheme.or(fallback)?
+    } else {
+        raw
+    };
+    if chosen.contains("://") {
+        Some(chosen.to_owned())
+    } else {
+        Some(format!("http://{chosen}"))
+    }
+}
+
+fn wildcard_match(pattern: &str, text: &str) -> bool {
+    let p = pattern.to_ascii_lowercase();
+    let t = text.to_ascii_lowercase();
+    if p == t {
+        return true;
+    }
+    if let Some(suffix) = p.strip_prefix('*') {
+        return t.ends_with(suffix);
+    }
+    if let Some(prefix) = p.strip_suffix('*') {
+        return t.starts_with(prefix);
+    }
+    false
+}
+
+#[cfg(windows)]
+fn system_proxy_for_url(url: &str) -> Option<String> {
+    use std::ffi::OsStr;
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::System::Registry::{
+        HKEY_CURRENT_USER, RRF_RT_REG_DWORD, RRF_RT_REG_SZ, RegGetValueW,
+    };
+
+    fn to_wide(value: &str) -> Vec<u16> {
+        OsStr::new(value).encode_wide().chain(Some(0)).collect()
+    }
+
+    let subkey = to_wide(r"Software\Microsoft\Windows\CurrentVersion\Internet Settings");
+    let enable_name = to_wide("ProxyEnable");
+    let mut enabled: u32 = 0;
+    let mut size = std::mem::size_of::<u32>() as u32;
+    let status = unsafe {
+        RegGetValueW(
+            HKEY_CURRENT_USER,
+            subkey.as_ptr(),
+            enable_name.as_ptr(),
+            RRF_RT_REG_DWORD,
+            std::ptr::null_mut(),
+            (&mut enabled as *mut u32).cast(),
+            &mut size,
+        )
+    };
+    if status != 0 || enabled == 0 {
+        return None;
+    }
+
+    fn read_reg_string(subkey: &[u16], name: &str) -> Option<String> {
+        let wide_name = to_wide(name);
+        let mut bytes: u32 = 0;
+        let st = unsafe {
+            RegGetValueW(
+                HKEY_CURRENT_USER,
+                subkey.as_ptr(),
+                wide_name.as_ptr(),
+                RRF_RT_REG_SZ,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                &mut bytes,
+            )
+        };
+        if st != 0 || bytes < 2 {
+            return None;
+        }
+        let mut buf = vec![0u16; (bytes as usize).div_ceil(2)];
+        let st = unsafe {
+            RegGetValueW(
+                HKEY_CURRENT_USER,
+                subkey.as_ptr(),
+                wide_name.as_ptr(),
+                RRF_RT_REG_SZ,
+                std::ptr::null_mut(),
+                buf.as_mut_ptr().cast(),
+                &mut bytes,
+            )
+        };
+        if st != 0 {
+            return None;
+        }
+        let len = buf.iter().position(|&c| c == 0).unwrap_or(buf.len());
+        Some(String::from_utf16_lossy(&buf[..len]))
+    }
+
+    let server = read_reg_string(&subkey, "ProxyServer")?;
+    let overrides = read_reg_string(&subkey, "ProxyOverride");
+    select_windows_proxy(&server, overrides.as_deref(), url)
+}
+
+#[cfg(not(windows))]
+fn system_proxy_for_url(_url: &str) -> Option<String> {
+    None
 }
 
 fn finish_partial(partial: &Path, expected_size: u64, expected_sha256: &str) -> Result<()> {
@@ -174,18 +380,22 @@ fn open_with_redirects(
         match response {
             Ok(response) => {
                 let status = response.status();
+                if matches!(status, 301 | 302 | 303 | 307 | 308) {
+                    let location = response
+                        .header("location")
+                        .context("重定向缺少 Location")?
+                        .to_owned();
+                    current = join_location(&current, &location)?;
+                    continue;
+                }
+                ensure!(
+                    matches!(status, 200 | 206),
+                    "下载失败，HTTP {status} {}",
+                    response.status_text()
+                );
                 let total = content_total(response.header("content-range"), expected_size);
                 let reader = response.into_reader();
                 return Ok((status, Box::new(reader), total));
-            }
-            Err(ureq::Error::Status(code, response))
-                if matches!(code, 301 | 302 | 303 | 307 | 308) =>
-            {
-                let location = response
-                    .header("location")
-                    .context("重定向缺少 Location")?
-                    .to_owned();
-                current = join_location(&current, &location)?;
             }
             Err(ureq::Error::Status(416, _)) => {
                 return Ok((416, Box::new(std::io::empty()), Some(expected_size)));
@@ -210,6 +420,10 @@ fn content_total(header: Option<&str>, _expected: u64) -> Option<u64> {
 
 fn join_location(current: &str, location: &str) -> Result<String> {
     if location.starts_with("https://") || location.starts_with("http://") {
+        ensure!(
+            !(current.starts_with("https://") && location.starts_with("http://")),
+            "拒绝从 HTTPS 重定向降级到 HTTP"
+        );
         return Ok(location.to_owned());
     }
     ensure!(location.starts_with('/'), "无法解析重定向地址");
@@ -393,6 +607,90 @@ mod tests {
         assert!(!destination.exists());
         assert!(!dir.join("file.bin.partial").exists());
         stop.store(true, Ordering::Relaxed);
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn windows_proxy_parser_and_https_downgrade_guard() {
+        assert_eq!(
+            select_windows_proxy("127.0.0.1:7897", Some("localhost;127.*;<local>"), "https://github.com/a/b").as_deref(),
+            Some("http://127.0.0.1:7897")
+        );
+        assert_eq!(
+            select_windows_proxy(
+                "http=127.0.0.1:8080;https=127.0.0.1:8443",
+                None,
+                "https://github.com/a/b"
+            )
+            .as_deref(),
+            Some("http://127.0.0.1:8443")
+        );
+        assert_eq!(
+            select_windows_proxy("127.0.0.1:7897", Some("localhost;127.*;*.local"), "http://127.0.0.1:9000/f"),
+            None
+        );
+        assert!(join_location("https://github.com/a", "http://evil.example/b").is_err());
+        assert_eq!(
+            join_location("https://github.com/a", "https://objects.githubusercontent.com/b").unwrap(),
+            "https://objects.githubusercontent.com/b"
+        );
+        assert!(format_progress(64 * 1024 * 1024, 128 * 1024 * 1024).contains("64.0 / 128.0 MiB (50%)"));
+        assert!(format_progress(512 * 1024, 1024 * 1024).contains("MiB"));
+        assert!(format_progress(1024, 2048).contains("1.0 / 2.0 KiB (50%)"));
+    }
+
+    #[test]
+    fn follows_302_redirect_and_downloads_payload() {
+        let body = b"redirected-payload-bytes-ok".to_vec();
+        let (target_url, stop_target) = serve(body.clone());
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let redir_addr = listener.local_addr().unwrap();
+        let stop_redir = Arc::new(AtomicBool::new(false));
+        let flag = Arc::clone(&stop_redir);
+        let loc = target_url.clone();
+        thread::spawn(move || {
+            listener.set_nonblocking(true).unwrap();
+            while !flag.load(Ordering::Relaxed) {
+                match listener.accept() {
+                    Ok((mut socket, _)) => {
+                        let _ = socket.set_read_timeout(Some(Duration::from_secs(2)));
+                        let mut buf = [0u8; 1024];
+                        let _ = socket.read(&mut buf);
+                        let resp = format!(
+                            "HTTP/1.1 302 Found\r\nLocation: {loc}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                        );
+                        let _ = socket.write_all(resp.as_bytes());
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        thread::sleep(Duration::from_millis(10));
+                    }
+                    Err(_) => break,
+                }
+            }
+        });
+        let dir = std::env::temp_dir().join(format!("yyur-fetch-302-{}-{}", std::process::id(), line!()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let dest = dir.join("file.bin");
+        let sha = {
+            let mut hasher = sha2::Sha256::new();
+            sha2::Digest::update(&mut hasher, &body);
+            hex(&hasher.finalize())
+        };
+        let cancel = AtomicBool::new(false);
+        download_verified(
+            &format!("http://{redir_addr}/start"),
+            &dest,
+            body.len() as u64,
+            &sha,
+            0,
+            &cancel,
+            &|_| {},
+        )
+        .unwrap();
+        assert_eq!(fs::read(&dest).unwrap(), body);
+        stop_redir.store(true, Ordering::Relaxed);
+        stop_target.store(true, Ordering::Relaxed);
         let _ = fs::remove_dir_all(dir);
     }
 }

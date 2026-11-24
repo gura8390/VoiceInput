@@ -78,9 +78,9 @@ Copy-Item '.\assets\text\rules_default.txt' '.\dist\app\config\hot-rule.txt'
 
 ## 模型下载
 
-缺少当前 ASR 或对齐器时，托盘弹出提示，菜单出现“下载模型”。程序按内置目录断点续传、校验 SHA256、解压，再生成与 `tools/models/prepare_external_weights.py` 相同规则的 `.weights.bin`。已经校验通过的文件会跳过。启动时只检查文件是否存在且非空；要重新校验请再执行下载。
+缺少当前 ASR 或对齐器时，托盘弹出提示，菜单出现“下载模型”。程序按内置目录断点续传（自动支持 `HTTPS_PROXY`/`HTTP_PROXY` 环境变量及 Windows 系统代理，拒绝 HTTPS 降级重定向）、校验 SHA256、解压，再生成与 `tools/models/prepare_external_weights.py` 相同规则的 `.weights.bin`，验证完成后自动清理临时压缩包与解压缓存。已经校验通过的文件会跳过。启动时只检查文件是否存在且非空；要重新校验请再执行下载。
 
-大陆网络可在 `settings.json` 设置 `model_mirror_base`，例如 `https://你的镜像`。实际请求地址是镜像前缀接上目录中的完整 URL。`model_download_retries` 默认 3。旧配置没有这些字段时仍能启动：预热默认开启，VAD 默认关闭。
+大陆网络也可在 `settings.json` 设置 `model_mirror_base`，例如 `https://你的镜像`。实际请求地址是镜像前缀接上目录中的完整 URL。`model_download_retries` 默认 3。旧配置没有这些字段时仍能启动：预热默认开启，VAD 默认关闭。
 
 ```powershell
 .\dist\app\语音输入.exe download-models
@@ -89,7 +89,7 @@ Copy-Item '.\assets\text\rules_default.txt' '.\dist\app\config\hot-rule.txt'
 
 0.6B 与对齐器来自 [HaujetZhao/Qwen3-ASR-GGUF](https://github.com/HaujetZhao/Qwen3-ASR-GGUF/releases/tag/models) 的 `Qwen3-ASR-0.6B-gguf.zip`、`Qwen3-ForceAligner-0.6B-gguf.zip`。1.7B 仍是原来的 FP16 ONNX 与 Q5_K_M GGUF，对应 [CapsWriter-Offline](https://github.com/HaujetZhao/CapsWriter-Offline/releases/tag/models) 的 `Qwen3-ASR-1.7B-q5_k.zip`。GGUF 仓库里的 `Qwen3-ASR-1.7B-gguf.zip` 是另一套 INT4/Q4_K 文件名，不能放进当前 1.7B 目录。
 
-`asr_warmup` 默认开启。每次 ASR 进程加载完成后，用两秒静音走一遍编码器并做一步解码，不读热词、不带上下文，结束时清理解码状态。`vad` 默认关闭。打开后，松手才把音频送去识别：没有足够语音的片段直接丢弃，有语音则裁掉首尾静音。阈值、最短语音和两端保留分别是 `vad_threshold`、`vad_min_speech_ms`、`vad_speech_pad_ms`。VAD 模型是 Silero 官方 `silero_vad.onnx`（约 2.1 MiB），放在 `models/silero/`。
+`asr_warmup` 默认开启：仅在桌面听写按住触发显式 `warmup` 加载 ASR 时，于 `trim_after_load` 裁剪工作集之前用 1 秒静音预热解码器（不拖慢冷启动文件转录，不破坏工作集裁剪），不读热词、不带上下文，结束时清理解码状态。`vad` 默认关闭。打开后在推理 worker 子进程内运行 Silero VAD（托盘主进程不加载 ONNX Runtime，随 120 秒闲置与 worker 一并完全卸载），且仅在检测到足够语音时才加载 ASR 进行识别；无语音片段直接丢弃，有语音则裁掉首尾静音。阈值、最短语音和两端保留分别是 `vad_threshold`、`vad_min_speech_ms`、`vad_speech_pad_ms`。VAD 模型是 Silero 官方 `silero_vad.onnx`（约 2.1 MiB），放在 `models/silero/`。
 
 ## 可选 ASR 模型
 

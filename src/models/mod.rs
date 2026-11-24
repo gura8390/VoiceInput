@@ -5,7 +5,7 @@ mod fetch;
 mod install;
 mod vad;
 
-pub use vad::{Decision, Silero, classify, trim_speech};
+pub use vad::{Decision, Silero, SpeechSpan, VadSession, trim_speech};
 
 use crate::config::Settings;
 use std::sync::atomic::AtomicBool;
