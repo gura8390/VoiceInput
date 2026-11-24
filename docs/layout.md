@@ -16,7 +16,7 @@ runtime/
   onnx/        ONNX Runtime 及其依赖
   audio/       PortAudio
   media/       FFmpeg 及独立启动所需的运行库
-models/        ASR 和时间戳对齐模型
+models/        ASR、时间戳对齐模型，以及可选的 models/silero/silero_vad.onnx
 cache/         Vulkan 管线缓存
 logs/          当前 Rust 进程日志
 docs/          当前说明、优化索引和许可证

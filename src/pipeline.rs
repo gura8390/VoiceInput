@@ -1,6 +1,8 @@
 use crate::{
     config::Settings,
     engine::{Aligner, Engine, EngineOptions},
+    models::{Silero, VadSession},
+    paths::AppPaths,
     protocol::{Recognition, Reply, Request},
     text::{TextFormatter, merge_by_text, merge_segments, sync_tokens_from_text},
 };
@@ -52,6 +54,8 @@ pub struct Pipeline {
     engine: Option<Engine>,
     aligner: Option<Aligner>,
     aligner_last_used: Instant,
+    silero: Option<Silero>,
+    vad_sessions: HashMap<String, VadSession>,
     sessions: HashMap<String, Recognition>,
 }
 impl Pipeline {
@@ -63,6 +67,8 @@ impl Pipeline {
             engine: None,
             aligner: None,
             aligner_last_used: Instant::now(),
+            silero: None,
+            vad_sessions: HashMap::new(),
             sessions: HashMap::new(),
         }
     }
@@ -73,9 +79,20 @@ impl Pipeline {
             self.aligner = None;
         }
     }
-    fn warmup(&mut self) -> Result<()> {
+    fn load_asr(&mut self, run_pipeline_warmup: bool) -> Result<()> {
         if self.engine.is_none() {
             self.engine = Some(Engine::load(&self.settings.app_dir, &self.options)?);
+            if run_pipeline_warmup
+                && self.settings.asr_warmup
+                && let Some(engine) = self.engine.as_mut()
+            {
+                // Run silent decoder prewarm BEFORE trimming the working set so
+                // `trim_after_load` keeps idle residency low, and only on explicit
+                // `Request::Warmup` so cold CLI/file jobs are never delayed.
+                if let Err(error) = engine.warmup_pipelines() {
+                    eprintln!("ASR 预热未完成，继续等待正式听写：{error:#}");
+                }
+            }
             if self.settings.trim_after_load {
                 // Match the existing application's post-initialization policy.
                 // GPU upload leaves model-file pages resident even though the
@@ -90,14 +107,33 @@ impl Pipeline {
         }
         Ok(())
     }
+    fn ensure_silero(&mut self) -> Result<&mut Silero> {
+        if self.silero.is_none() {
+            let paths = AppPaths::new(&self.settings.app_dir);
+            let dll = match self.settings.onnx_dll.as_ref() {
+                Some(path) if path.is_absolute() => path.clone(),
+                Some(path) => self.settings.app_dir.join(path),
+                None => paths.onnx(),
+            };
+            self.silero = Some(Silero::load(&dll, &paths.vad_model())?);
+        }
+        self.silero.as_mut().context("VAD 未加载")
+    }
     pub fn dispatch(&mut self, request: Request, pcm: &[f32]) -> Reply {
         // The aligner's idle deadline is independent of active dictation jobs.
         // A busy input queue must not keep an otherwise unused model alive.
         self.cleanup_idle();
         let id = request.id();
         match &request {
-            Request::Warmup { .. } | Request::Segment { .. } => {
-                if let Err(error) = self.warmup() {
+            Request::Warmup { .. } => {
+                if let Err(error) = self.load_asr(true) {
+                    let mut r = Reply::error(id, format!("{error:#}"));
+                    r.kind = "load_error".into();
+                    return r;
+                }
+            }
+            Request::Segment { .. } => {
+                if let Err(error) = self.load_asr(false) {
                     let mut r = Reply::error(id, format!("{error:#}"));
                     r.kind = "load_error".into();
                     return r;
@@ -127,11 +163,38 @@ impl Pipeline {
         } = request
         else {
             match request {
+                Request::VadScan {
+                    task_id, is_final, ..
+                } => {
+                    let threshold = self.settings.vad_threshold;
+                    let mut session = self
+                        .vad_sessions
+                        .remove(&task_id)
+                        .unwrap_or_default();
+                    let scan = self
+                        .ensure_silero()?
+                        .scan_chunk(&mut session, pcm, threshold, is_final);
+                    if !is_final && scan.is_ok() {
+                        self.vad_sessions.insert(task_id, session);
+                    }
+                    let span = scan?;
+                    let mut reply = Reply::ok(id, "vad");
+                    reply.metrics = serde_json::json!({
+                        "speech_samples": span.speech_samples,
+                        "first": span.first,
+                        "last": span.last,
+                        "total_samples": span.total_samples,
+                    });
+                    return Ok(reply);
+                }
                 Request::DropSession { task_id, .. } => {
                     self.sessions.remove(&task_id);
+                    self.vad_sessions.remove(&task_id);
                 }
                 Request::Shutdown { .. } => {
                     self.sessions.clear();
+                    self.vad_sessions.clear();
+                    self.silero = None;
                     self.aligner = None;
                     self.engine = None;
                 }
@@ -478,5 +541,35 @@ mod tests {
         assert_eq!(parts[1].audio.len(), 20 * 16000);
         assert_eq!(parts[1].offset, 60.0);
         assert!(!parts[0].is_final && parts[1].is_final);
+    }
+
+    #[test]
+    fn vad_scan_never_triggers_asr_load_and_drop_session_clears_vad() {
+        let mut settings = Settings::default();
+        settings.app_dir = std::env::temp_dir().join(format!("yyur-vad-noasr-{}", std::process::id()));
+        let mut pipeline = Pipeline::new(settings);
+        let reply = pipeline.dispatch(
+            Request::VadScan {
+                id: 11,
+                task_id: "mic-vad-1".into(),
+                is_final: true,
+            },
+            &vec![0.0; 1600],
+        );
+        // Must fail on missing VAD/ORT without attempting to load the ASR model.
+        assert_eq!(reply.kind, "error");
+        assert!(pipeline.engine.is_none());
+        pipeline
+            .vad_sessions
+            .insert("mic-vad-2".into(), VadSession::new());
+        let dropped = pipeline.dispatch(
+            Request::DropSession {
+                id: 12,
+                task_id: "mic-vad-2".into(),
+            },
+            &[],
+        );
+        assert_eq!(dropped.kind, "ready");
+        assert!(!pipeline.vad_sessions.contains_key("mic-vad-2"));
     }
 }

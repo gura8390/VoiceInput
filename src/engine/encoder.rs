@@ -22,7 +22,7 @@ static PROFILE_ID: AtomicU64 = AtomicU64::new(0);
 fn builder_error<R>(error: ort::Error<R>) -> anyhow::Error {
     anyhow::anyhow!("{error}")
 }
-fn init_ort(path: &Path) -> Result<()> {
+pub(super) fn init_ort(path: &Path) -> Result<()> {
     let path = path
         .canonicalize()
         .with_context(|| format!("ONNX Runtime DLL {}", path.display()))?;

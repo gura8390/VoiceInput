@@ -2,6 +2,7 @@ use crate::{
     config::Settings,
     desktop::{self, DesktopEvent, DesktopOutput},
     media,
+    models::{self, Decision, SpeechSpan},
     pipeline::{AudioSegment, SegmentBuffer, now},
     protocol::{Recognition, Request},
     random::SamplerSeeds,
@@ -272,6 +273,115 @@ impl RuntimeClient {
         )?;
         Ok((transcript, files))
     }
+    pub fn vad_filter(&self, task_id: &str, audio: &[f32]) -> Result<Decision> {
+        if audio.is_empty() {
+            return Ok(Decision::Drop);
+        }
+        const VAD_CHUNK_SAMPLES: usize = 60 * 16_000;
+        let total = audio.len();
+        let mut offset = 0usize;
+        let mut span = SpeechSpan::default();
+        while offset < total {
+            let end = (offset + VAD_CHUNK_SAMPLES).min(total);
+            let is_final = end == total;
+            let reply = self.worker.call(
+                Request::VadScan {
+                    id: next_id(),
+                    task_id: task_id.into(),
+                    is_final,
+                },
+                audio[offset..end].to_vec(),
+            );
+            let reply = match reply {
+                Ok(reply) => reply,
+                Err(error) => {
+                    let _ = self.worker.submit(
+                        Request::DropSession {
+                            id: next_id(),
+                            task_id: task_id.into(),
+                        },
+                        Vec::new(),
+                    );
+                    return Err(error);
+                }
+            };
+            if is_final {
+                let metrics = &reply.metrics;
+                span = SpeechSpan {
+                    speech_samples: metrics
+                        .get("speech_samples")
+                        .and_then(|v| v.as_u64())
+                        .context("VAD 缺少 speech_samples")?
+                        as usize,
+                    first: metrics
+                        .get("first")
+                        .and_then(|v| v.as_u64())
+                        .map(|v| v as usize),
+                    last: metrics
+                        .get("last")
+                        .and_then(|v| v.as_u64())
+                        .context("VAD 缺少 last")? as usize,
+                    total_samples: metrics
+                        .get("total_samples")
+                        .and_then(|v| v.as_u64())
+                        .unwrap_or(total as u64) as usize,
+                };
+            }
+            offset = end;
+        }
+        match span.resolve_bounds(
+            self.settings.vad_min_speech_ms,
+            self.settings.vad_speech_pad_ms,
+        ) {
+            Some((start, end)) => Ok(Decision::Keep(audio[start..end.min(audio.len())].to_vec())),
+            None => Ok(Decision::Drop),
+        }
+    }
+}
+
+struct MicSession {
+    id: String,
+    started: f64,
+    cache: SegmentBuffer,
+    held: Option<Vec<f32>>,
+}
+
+fn finish_dictation(
+    client: &RuntimeClient,
+    output: &mpsc::Sender<DesktopOutput>,
+    live: MicSession,
+) -> Result<()> {
+    let MicSession {
+        id,
+        started,
+        mut cache,
+        held,
+    } = live;
+    if let Some(audio) = held {
+        match client.vad_filter(&id, &audio)? {
+            Decision::Drop => {
+                let _ = output.send(DesktopOutput::State("未检测到语音".into()));
+                let _ = output.send(DesktopOutput::State("离线听写已就绪".into()));
+                return Ok(());
+            }
+            Decision::Keep(trimmed) => {
+                let _ = output.send(DesktopOutput::State("正在识别".into()));
+                for part in cache.append(&trimmed) {
+                    client.segment(&id, "mic", part, started)?;
+                }
+            }
+        }
+    } else {
+        let _ = output.send(DesktopOutput::State("正在识别".into()));
+    }
+    let result = client.segment(&id, "mic", cache.finish(), started)?;
+    let force = desktop::foreground_process_name().eq_ignore_ascii_case("weixin.exe");
+    let text = client.text.lock().unwrap().mic(&result.text, force)?;
+    if !text.is_empty() {
+        let _ = output.send(DesktopOutput::Text(text));
+    }
+    let _ = output.send(DesktopOutput::State("离线听写已就绪".into()));
+    Ok(())
 }
 
 pub fn desktop(settings: Settings, seed: Option<u32>, passive: bool) -> Result<()> {
@@ -313,10 +423,12 @@ pub fn desktop(settings: Settings, seed: Option<u32>, passive: bool) -> Result<(
                 }
             }
         })?;
+    let download_cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let tray_cancel = Arc::clone(&download_cancel);
     let dispatcher = thread::Builder::new()
         .name("desktop-dispatch".into())
         .spawn(move || {
-            let mut session: Option<(String, f64, SegmentBuffer)> = None;
+            let mut session: Option<MicSession> = None;
             while let Ok(event) = events_rx.recv() {
                 let quitting = matches!(event, DesktopEvent::Quit);
                 let voice_event = matches!(
@@ -329,44 +441,63 @@ pub fn desktop(settings: Settings, seed: Option<u32>, passive: bool) -> Result<(
                 let result = (|| -> Result<()> {
                     match event {
                         DesktopEvent::Start => {
-                            session = Some((
-                                format!("mic-{}", next_id()),
-                                now(),
-                                SegmentBuffer::new(
+                            session = Some(MicSession {
+                                id: format!("mic-{}", next_id()),
+                                started: now(),
+                                cache: SegmentBuffer::new(
                                     dispatch_client.settings.segment_seconds,
                                     dispatch_client.settings.overlap_seconds,
                                 ),
-                            ));
-                            dispatch_client.warmup()?;
+                                held: dispatch_client.settings.vad.then(Vec::new),
+                            });
+                            if !dispatch_client.settings.vad {
+                                dispatch_client.warmup()?;
+                            }
                             let _ = dispatch_output.send(DesktopOutput::State("正在听写".into()));
                         }
                         DesktopEvent::Audio(audio) => {
-                            if let Some((id, start, cache)) = session.as_mut() {
-                                // Inference is much faster than recording, but this path remains FIFO and bounded by segments.
-                                for part in cache.append(&audio) {
-                                    dispatch_client.segment(id, "mic", part, *start)?;
+                            if let Some(live) = session.as_mut() {
+                                if let Some(held) = live.held.as_mut() {
+                                    const LIMIT: usize = 10 * 60 * 16_000;
+                                    if held.len().saturating_add(audio.len()) > LIMIT {
+                                        anyhow::bail!("单次按住超过 10 分钟，已取消本次识别");
+                                    }
+                                    held.extend_from_slice(&audio);
+                                } else {
+                                    // Inference is much faster than recording, but this path remains FIFO and bounded by segments.
+                                    for part in live.cache.append(&audio) {
+                                        dispatch_client.segment(
+                                            &live.id,
+                                            "mic",
+                                            part,
+                                            live.started,
+                                        )?;
+                                    }
                                 }
                             }
                         }
                         DesktopEvent::Stop => {
-                            if let Some((id, start, mut cache)) = session.take() {
-                                let _ =
-                                    dispatch_output.send(DesktopOutput::State("正在识别".into()));
-                                let result =
-                                    dispatch_client.segment(&id, "mic", cache.finish(), start)?;
-                                let force = desktop::foreground_process_name()
-                                    .eq_ignore_ascii_case("weixin.exe");
-                                let text = dispatch_client
-                                    .text
-                                    .lock()
-                                    .unwrap()
-                                    .mic(&result.text, force)?;
-                                if !text.is_empty() {
-                                    let _ = dispatch_output.send(DesktopOutput::Text(text));
-                                }
-                                let _ = dispatch_output
-                                    .send(DesktopOutput::State("离线听写已就绪".into()));
+                            if let Some(live) = session.take() {
+                                finish_dictation(&dispatch_client, &dispatch_output, live)?;
                             }
+                        }
+                        DesktopEvent::DownloadModels => {
+                            let settings = dispatch_client.settings.clone();
+                            let cancel = std::sync::Arc::clone(&download_cancel);
+                            let output = dispatch_output.clone();
+                            thread::spawn(move || {
+                                let progress = |message: &str| {
+                                    let _ = output.send(DesktopOutput::State(message.to_owned()));
+                                };
+                                let finished =
+                                    models::install_selected(&settings, false, &cancel, &progress);
+                                let (ok, message) = match finished {
+                                    Ok(summary) => (true, summary),
+                                    Err(error) => (false, format!("下载模型失败：{error:#}")),
+                                };
+                                let _ =
+                                    output.send(DesktopOutput::DownloadFinished { ok, message });
+                            });
                         }
                         DesktopEvent::Transcribe(file) => {
                             files_tx.try_send(file).map_err(|_| {
@@ -380,11 +511,11 @@ pub fn desktop(settings: Settings, seed: Option<u32>, passive: bool) -> Result<(
                 })();
                 if let Err(error) = result {
                     if voice_event {
-                        if let Some((task_id, _, _)) = session.take() {
+                        if let Some(live) = session.take() {
                             let _ = dispatch_client.worker.submit(
                                 Request::DropSession {
                                     id: next_id(),
-                                    task_id,
+                                    task_id: live.id,
                                 },
                                 Vec::new(),
                             );
@@ -399,7 +530,10 @@ pub fn desktop(settings: Settings, seed: Option<u32>, passive: bool) -> Result<(
             drop(files_tx);
             let _ = file_thread.join();
         })?;
+    let models_missing = models::models_missing(&settings);
     let mut options = desktop::DesktopOptions::new(settings.app_dir);
+    options.models_missing = models_missing;
+    options.cancel_download = tray_cancel;
     if passive {
         options.enable_hooks = false;
         options.enable_capture = false;

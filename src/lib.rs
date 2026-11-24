@@ -5,6 +5,7 @@ pub mod config;
 pub mod desktop;
 pub mod engine;
 pub mod media;
+pub mod models;
 pub mod paths;
 pub mod pipeline;
 pub mod process_guard;

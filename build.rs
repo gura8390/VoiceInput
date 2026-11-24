@@ -7,6 +7,10 @@ fn main() {
     if env::var("CARGO_CFG_TARGET_OS").as_deref() != Ok("windows") {
         return;
     }
+    // Lets a machine without rc.exe type-check the Windows target. Normal builds leave this unset.
+    if env::var_os("YYUR_SKIP_WIN_RESOURCES").is_some() {
+        return;
+    }
 
     let version = env::var("CARGO_PKG_VERSION").expect("package version");
     let mut numbers: Vec<_> = version
