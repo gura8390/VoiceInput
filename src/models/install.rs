@@ -111,7 +111,7 @@ fn ensure_package(
             progress(&format!("{} 校验通过，跳过", file.install_name));
         } else {
             let archive_path = archive.as_deref().context("缺少压缩包")?;
-            let source = extract_member(archive_path, file, &dest_dir, progress)?;
+            let source = extract_member(archive_path, file, &dest_dir, cancel, progress)?;
             replace_file(&source, &dest)?;
         }
     }
@@ -177,6 +177,7 @@ fn ensure_onnx(
             archive,
             file,
             &app.join("cache/downloads/staging").join(package.id),
+            cancel,
             progress,
         )?
     };
@@ -196,15 +197,35 @@ fn ensure_onnx(
         let _ = fs::remove_dir_all(&temp);
         return Err(error);
     }
-    ensure!(
-        onnx_external_sidecar_ready(&prepared, &weights_name)?,
-        "外置权重生成后未能通过结构检查"
-    );
-    let prepared_weights = prepared.with_extension("weights.bin");
-    let prepared_receipt = prepared.with_extension("external.json");
-    replace_file(&prepared_weights, &weights)?;
-    replace_file(&prepared, dest)?;
-    replace_file(&prepared_receipt, &dest.with_extension("external.json"))?;
+    if let Err(error) = (|| -> Result<()> {
+        ensure!(
+            onnx_external_sidecar_ready(&prepared, &weights_name)?,
+            "外置权重生成后未能通过结构检查"
+        );
+        let prepared_weights = prepared.with_extension("weights.bin");
+        let prepared_receipt = prepared.with_extension("external.json");
+        let weights_backup = weights.with_file_name(format!("{weights_name}.rollback"));
+        let had_old_weights = weights.is_file();
+        if had_old_weights {
+            let _ = fs::remove_file(&weights_backup);
+            fs::copy(&weights, &weights_backup)?;
+        }
+        replace_file(&prepared_weights, &weights)?;
+        if let Err(error) = replace_file(&prepared, dest) {
+            if had_old_weights {
+                let _ = replace_file(&weights_backup, &weights);
+            } else {
+                let _ = fs::remove_file(&weights);
+            }
+            return Err(error);
+        }
+        let _ = fs::remove_file(&weights_backup);
+        replace_file(&prepared_receipt, &dest.with_extension("external.json"))?;
+        Ok(())
+    })() {
+        let _ = fs::remove_dir_all(&temp);
+        return Err(error);
+    }
     let _ = fs::remove_dir_all(&temp);
     progress(&format!("已生成 {}", weights_name));
     Ok(())
@@ -284,6 +305,7 @@ fn extract_member(
     archive_path: &Path,
     file: &catalog::ModelFile,
     directory: &Path,
+    cancel: &AtomicBool,
     progress: &dyn Fn(&str),
 ) -> Result<PathBuf> {
     fs::create_dir_all(directory)?;
@@ -303,24 +325,37 @@ fn extract_member(
         file.install_name
     );
     let temp = directory.join(format!("{}.extracting", file.install_name));
-    let mut output = File::create(&temp)?;
-    let mut hasher = Sha256::new();
-    let mut buffer = [0u8; 1024 * 1024];
-    let mut read_bytes = 0u64;
-    loop {
-        let n = entry.read(&mut buffer)?;
-        if n == 0 {
-            break;
+    let extracted = (|| -> Result<String> {
+        let mut output = File::create(&temp)?;
+        let mut hasher = Sha256::new();
+        // Heap-allocate the 1 MiB copy buffer to avoid overflowing the 1 MiB Windows main thread stack.
+        let mut buffer = vec![0u8; 1024 * 1024];
+        let mut read_bytes = 0u64;
+        loop {
+            if cancel.load(Ordering::Acquire) {
+                bail!("已取消下载");
+            }
+            let n = entry.read(&mut buffer)?;
+            if n == 0 {
+                break;
+            }
+            read_bytes += n as u64;
+            ensure!(read_bytes <= file.size, "解压超出目录中的大小");
+            sha2::Digest::update(&mut hasher, &buffer[..n]);
+            output.write_all(&buffer[..n])?;
         }
-        read_bytes += n as u64;
-        ensure!(read_bytes <= file.size, "解压超出目录中的大小");
-        sha2::Digest::update(&mut hasher, &buffer[..n]);
-        output.write_all(&buffer[..n])?;
-    }
-    output.flush()?;
-    drop(output);
-    ensure!(read_bytes == file.size, "解压结果不完整");
-    let actual = super::hex(&hasher.finalize());
+        output.flush()?;
+        drop(output);
+        ensure!(read_bytes == file.size, "解压结果不完整");
+        Ok(super::hex(&hasher.finalize()))
+    })();
+    let actual = match extracted {
+        Ok(hash) => hash,
+        Err(error) => {
+            let _ = fs::remove_file(&temp);
+            return Err(error);
+        }
+    };
     if actual != file.sha256 {
         let _ = fs::remove_file(&temp);
         bail!("{} 解压后的 SHA256 不一致", file.install_name);

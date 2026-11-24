@@ -60,7 +60,16 @@ pub(crate) fn download_verified(
                 }
                 progress(&format!("下载中断，正在重试（{attempt}/{attempts}）"));
                 last_error = Some(error);
-                std::thread::sleep(Duration::from_millis((400 * u64::from(attempt)).min(8_000)));
+                let delay_ms = (400 * u64::from(attempt)).min(8_000);
+                let mut waited = 0u64;
+                while waited < delay_ms {
+                    if cancel.load(Ordering::Acquire) {
+                        bail!("已取消下载");
+                    }
+                    let step = (delay_ms - waited).min(100);
+                    std::thread::sleep(Duration::from_millis(step));
+                    waited += step;
+                }
             }
         }
     }
@@ -95,11 +104,15 @@ fn download_once(
     }
     let agent = build_agent(url)?;
     let (status, mut reader, total) = open_with_redirects(&agent, url, have, expected_size)?;
+    if status == 416 {
+        if have < expected_size {
+            let _ = fs::remove_file(partial);
+            bail!("服务器拒绝续传（HTTP 416），已清理残片，请重试");
+        }
+        return finish_partial(partial, expected_size, expected_sha256);
+    }
     if status == 200 && have != 0 {
         have = 0;
-    }
-    if status == 416 {
-        return finish_partial(partial, expected_size, expected_sha256);
     }
     if let Some(total) = total {
         ensure!(total == expected_size, "服务器报告的大小与目录不一致");
@@ -113,7 +126,7 @@ fn download_once(
     } else {
         OpenOptions::new().append(true).open(partial)?
     };
-    let mut buffer = [0u8; 256 * 1024];
+    let mut buffer = vec![0u8; 256 * 1024];
     let mut written = have;
     loop {
         if cancel.load(Ordering::Acquire) {
@@ -174,7 +187,7 @@ fn build_agent(url: &str) -> Result<ureq::Agent> {
         .timeout_read(Duration::from_secs(120))
         .redirects(0)
         .try_proxy_from_env(true);
-    if !has_env_proxy() && !is_loopback_url(url) {
+    if !has_env_proxy_for(url) && !is_loopback_url(url) {
         if let Some(proxy_url) = system_proxy_for_url(url) {
             if let Ok(proxy) = ureq::Proxy::new(&proxy_url) {
                 builder = builder.proxy(proxy);
@@ -184,17 +197,26 @@ fn build_agent(url: &str) -> Result<ureq::Agent> {
     Ok(builder.build())
 }
 
-fn has_env_proxy() -> bool {
-    [
-        "HTTPS_PROXY",
-        "https_proxy",
-        "HTTP_PROXY",
-        "http_proxy",
-        "ALL_PROXY",
-        "all_proxy",
-    ]
-    .iter()
-    .any(|name| std::env::var(name).is_ok_and(|value| !value.trim().is_empty()))
+fn has_env_proxy_for(url: &str) -> bool {
+    let scheme = url
+        .split_once("://")
+        .map(|(s, _)| s.to_ascii_lowercase())
+        .unwrap_or_default();
+    let names: &[&str] = match scheme.as_str() {
+        "https" => &["HTTPS_PROXY", "https_proxy", "ALL_PROXY", "all_proxy"],
+        "http" => &["HTTP_PROXY", "http_proxy", "ALL_PROXY", "all_proxy"],
+        _ => &[
+            "HTTPS_PROXY",
+            "https_proxy",
+            "HTTP_PROXY",
+            "http_proxy",
+            "ALL_PROXY",
+            "all_proxy",
+        ],
+    };
+    names
+        .iter()
+        .any(|name| std::env::var(name).is_ok_and(|value| !value.trim().is_empty()))
 }
 
 fn extract_host(url: &str) -> Option<&str> {
@@ -371,12 +393,11 @@ fn open_with_redirects(
 ) -> Result<(u16, Box<dyn Read + Send>, Option<u64>)> {
     let mut current = url.to_owned();
     for _ in 0..8 {
-        let range = format!("bytes={offset}-");
-        let response = agent
-            .get(&current)
-            .set("Range", &range)
-            .set("User-Agent", "YuYbUuRu")
-            .call();
+        let mut request = agent.get(&current).set("User-Agent", "YuYbUuRu");
+        if offset > 0 {
+            request = request.set("Range", &format!("bytes={offset}-"));
+        }
+        let response = request.call();
         match response {
             Ok(response) => {
                 let status = response.status();
@@ -393,7 +414,21 @@ fn open_with_redirects(
                     "下载失败，HTTP {status} {}",
                     response.status_text()
                 );
-                let total = content_total(response.header("content-range"), expected_size);
+                let total = if status == 206 {
+                    let range_header = response
+                        .header("content-range")
+                        .context("HTTP 206 响应缺少 Content-Range")?;
+                    let (start, total) = parse_content_range(range_header)?;
+                    ensure!(
+                        start == offset,
+                        "服务器返回的续传起始位置（{start}）与本地进度（{offset}）不一致"
+                    );
+                    total
+                } else {
+                    response
+                        .header("content-length")
+                        .and_then(|value| value.trim().parse::<u64>().ok())
+                };
                 let reader = response.into_reader();
                 return Ok((status, Box::new(reader), total));
             }
@@ -409,25 +444,50 @@ fn open_with_redirects(
     bail!("重定向次数过多")
 }
 
-fn content_total(header: Option<&str>, _expected: u64) -> Option<u64> {
-    let header = header?;
-    let total = header.rsplit('/').next()?;
-    if total == "*" {
-        return None;
-    }
-    total.parse().ok()
+fn parse_content_range(header: &str) -> Result<(u64, Option<u64>)> {
+    let trimmed = header.trim();
+    let rest = trimmed
+        .strip_prefix("bytes ")
+        .or_else(|| trimmed.strip_prefix("BYTES "))
+        .context("不支持的 Content-Range 单位")?;
+    let (span, total_part) = rest
+        .split_once('/')
+        .context("Content-Range 缺少总长度分隔符")?;
+    let (start_str, _end_str) = span
+        .split_once('-')
+        .context("Content-Range 缺少起止偏移")?;
+    let start = start_str
+        .trim()
+        .parse::<u64>()
+        .context("Content-Range 起始偏移无效")?;
+    let total = if total_part.trim() == "*" {
+        None
+    } else {
+        Some(
+            total_part
+                .trim()
+                .parse::<u64>()
+                .context("Content-Range 总长度无效")?,
+        )
+    };
+    Ok((start, total))
 }
 
 fn join_location(current: &str, location: &str) -> Result<String> {
-    if location.starts_with("https://") || location.starts_with("http://") {
+    let current_lower = current.to_ascii_lowercase();
+    let location_lower = location.to_ascii_lowercase();
+    if location_lower.starts_with("https://") || location_lower.starts_with("http://") {
         ensure!(
-            !(current.starts_with("https://") && location.starts_with("http://")),
+            !(current_lower.starts_with("https://") && location_lower.starts_with("http://")),
             "拒绝从 HTTPS 重定向降级到 HTTP"
         );
         return Ok(location.to_owned());
     }
-    ensure!(location.starts_with('/'), "无法解析重定向地址");
     let (scheme, rest) = current.split_once("://").context("下载地址无效")?;
+    if location.starts_with("//") {
+        return Ok(format!("{scheme}:{location}"));
+    }
+    ensure!(location.starts_with('/'), "无法解析重定向地址");
     let host = rest.split('/').next().context("下载地址缺少主机")?;
     Ok(format!("{scheme}://{host}{location}"))
 }
@@ -634,6 +694,17 @@ mod tests {
             join_location("https://github.com/a", "https://objects.githubusercontent.com/b").unwrap(),
             "https://objects.githubusercontent.com/b"
         );
+        assert_eq!(
+            join_location("https://github.com/a", "//cdn.example.com/pkg.zip").unwrap(),
+            "https://cdn.example.com/pkg.zip"
+        );
+        assert_eq!(
+            join_location("https://github.com/a/b", "/download/pkg.zip").unwrap(),
+            "https://github.com/download/pkg.zip"
+        );
+        assert_eq!(parse_content_range("bytes 128-255/512").unwrap(), (128, Some(512)));
+        assert_eq!(parse_content_range("bytes 64-127/*").unwrap(), (64, None));
+        assert!(parse_content_range("items 0-10/20").is_err());
         assert!(format_progress(64 * 1024 * 1024, 128 * 1024 * 1024).contains("64.0 / 128.0 MiB (50%)"));
         assert!(format_progress(512 * 1024, 1024 * 1024).contains("MiB"));
         assert!(format_progress(1024, 2048).contains("1.0 / 2.0 KiB (50%)"));
@@ -691,6 +762,71 @@ mod tests {
         assert_eq!(fs::read(&dest).unwrap(), body);
         stop_redir.store(true, Ordering::Relaxed);
         stop_target.store(true, Ordering::Relaxed);
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn rejects_mismatched_206_range_start_and_200_content_length() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let stop = Arc::new(AtomicBool::new(false));
+        let flag = Arc::clone(&stop);
+        thread::spawn(move || {
+            listener.set_nonblocking(true).unwrap();
+            while !flag.load(Ordering::Relaxed) {
+                match listener.accept() {
+                    Ok((mut socket, _)) => {
+                        let _ = socket.set_read_timeout(Some(Duration::from_secs(2)));
+                        let mut buf = [0u8; 2048];
+                        let n = socket.read(&mut buf).unwrap_or(0);
+                        let req = String::from_utf8_lossy(&buf[..n]);
+                        let resp = if req.contains("GET /bad-206 ") {
+                            "HTTP/1.1 206 Partial Content\r\nContent-Range: bytes 0-9/20\r\nContent-Length: 10\r\nConnection: close\r\n\r\n0123456789"
+                        } else {
+                            "HTTP/1.1 200 OK\r\nContent-Length: 999\r\nConnection: close\r\n\r\nshort"
+                        };
+                        let _ = socket.write_all(resp.as_bytes());
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        thread::sleep(Duration::from_millis(10));
+                    }
+                    Err(_) => break,
+                }
+            }
+        });
+        let dir = std::env::temp_dir().join(format!("yyur-fetch-range-{}-{}", std::process::id(), line!()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let dest = dir.join("file.bin");
+        let partial = dir.join("file.bin.partial");
+        fs::write(&partial, b"01234").unwrap();
+        let cancel = AtomicBool::new(false);
+        let err_206 = download_verified(
+            &format!("http://{addr}/bad-206"),
+            &dest,
+            20,
+            &"00".repeat(32),
+            0,
+            &cancel,
+            &|_| {},
+        );
+        assert!(err_206.is_err());
+        assert!(format!("{:#}", err_206.unwrap_err()).contains("续传起始位置"));
+
+        let _ = fs::remove_file(&partial);
+        let err_200 = download_verified(
+            &format!("http://{addr}/bad-200"),
+            &dest,
+            20,
+            &"00".repeat(32),
+            0,
+            &cancel,
+            &|_| {},
+        );
+        assert!(err_200.is_err());
+        assert!(format!("{:#}", err_200.unwrap_err()).contains("大小与目录不一致"));
+
+        stop.store(true, Ordering::Relaxed);
         let _ = fs::remove_dir_all(dir);
     }
 }

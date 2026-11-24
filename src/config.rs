@@ -108,7 +108,7 @@ pub struct Settings {
     pub format_spell: bool,
     pub segment_seconds: usize,
     pub overlap_seconds: usize,
-    /// Run one silent encoder+decoder pass after each ASR load. Default on.
+    /// Run one silent encoder+decoder pass after explicit desktop warmup. Default off.
     pub asr_warmup: bool,
     /// Drop no-speech clips and trim silence after hold-to-dictate. Default off.
     pub vad: bool,
@@ -164,7 +164,7 @@ impl Default for Settings {
             format_spell: true,
             segment_seconds: 60,
             overlap_seconds: 4,
-            asr_warmup: true,
+            asr_warmup: false,
             vad: false,
             vad_threshold: 0.5,
             vad_min_speech_ms: 250,
@@ -396,9 +396,9 @@ mod tests {
     }
 
     #[test]
-    fn old_settings_keep_warmup_on_and_vad_off() {
+    fn old_settings_keep_warmup_and_vad_off() {
         let old: Settings = serde_json::from_str("{}").unwrap();
-        assert!(old.asr_warmup);
+        assert!(!old.asr_warmup);
         assert!(!old.vad);
         assert_eq!(old.vad_threshold, 0.5);
         assert_eq!(old.vad_min_speech_ms, 250);
@@ -406,10 +406,10 @@ mod tests {
         assert!(old.model_mirror_base.is_empty());
         assert_eq!(old.model_download_retries, 3);
         let configured: Settings = serde_json::from_str(
-            r#"{"asr_warmup":false,"vad":true,"vad_threshold":0.6,"vad_min_speech_ms":400,"vad_speech_pad_ms":60,"model_mirror_base":"https://mirror.example/github","model_download_retries":2}"#,
+            r#"{"asr_warmup":true,"vad":true,"vad_threshold":0.6,"vad_min_speech_ms":400,"vad_speech_pad_ms":60,"model_mirror_base":"https://mirror.example/github","model_download_retries":2}"#,
         )
         .unwrap();
-        assert!(!configured.asr_warmup);
+        assert!(configured.asr_warmup);
         assert!(configured.vad);
         assert_eq!(configured.vad_threshold, 0.6);
         assert_eq!(configured.vad_min_speech_ms, 400);
@@ -417,7 +417,7 @@ mod tests {
         let roundtrip: Settings =
             serde_json::from_value(serde_json::to_value(&configured).unwrap()).unwrap();
         assert_eq!(roundtrip.model_mirror_base, configured.model_mirror_base);
-        assert!(!roundtrip.asr_warmup);
+        assert!(roundtrip.asr_warmup);
         assert!(resolve_model_url(
             "https://github.com/HaujetZhao/Qwen3-ASR-GGUF/releases/download/models/Qwen3-ASR-0.6B-gguf.zip",
             &configured.model_mirror_base
@@ -449,7 +449,7 @@ mod tests {
         let path = directory.join("settings.json");
         std::fs::write(&path, "{}").unwrap();
         let loaded = Settings::load(Some(&path), None).unwrap();
-        assert!(loaded.asr_warmup && !loaded.vad);
+        assert!(!loaded.asr_warmup && !loaded.vad);
         let _ = std::fs::remove_dir_all(&directory);
     }
 

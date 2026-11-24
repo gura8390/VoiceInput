@@ -34,7 +34,8 @@ use std::{fs::File, io::Read, path::Path};
 pub(crate) fn sha256_file(path: &Path) -> Result<String> {
     let mut file = File::open(path).with_context(|| format!("读取 {}", path.display()))?;
     let mut hasher = Sha256::new();
-    let mut buffer = [0u8; 1024 * 1024];
+    // Heap-allocate the 1 MiB read buffer so calling from the 1 MiB Windows main thread stack never overflows.
+    let mut buffer = vec![0u8; 1024 * 1024];
     loop {
         let n = file.read(&mut buffer)?;
         if n == 0 {

@@ -1,10 +1,19 @@
 # 语音输入 · YuYbUuRu
 
-Windows x64 离线语音输入工具，当前版本 **0.6.0**。启动文件统一为 **语音输入.exe**，应用图标与中文产品信息嵌入程序。正式安装和示例配置默认使用 Qwen3-ASR-1.7B，0.6B 可选。沿用 Vulkan 解码、CPU 编码器、ASR 单输出预留和固定形状前端缓冲复用。应用层使用 Rust，日常运行无需 Python；推理使用 ONNX Runtime 和 llama.cpp 原生库。
+Windows x64 离线语音输入工具，当前版本 **0.6.0-p2**（Windows 文件版本 `0.6.0.2`）。启动文件统一为 **语音输入.exe**，应用图标与中文产品信息嵌入程序。正式安装和示例配置默认使用 Qwen3-ASR-1.7B，0.6B 可选。沿用 Vulkan 解码、CPU 编码器、ASR 单输出预留和固定形状前端缓冲复用。应用层使用 Rust，日常运行无需 Python；推理使用 ONNX Runtime 和 llama.cpp 原生库。
 
-保留三个功能：实时听写、热词替换、音视频文件转录。长按 CapsLock 或鼠标 X2 超过 0.3 秒开始听写，松开后输入；短按补发原键。托盘提供热词编辑、文件转录及退出。文件输出 TXT、JSON、SRT，默认保留已有同名输出。
+保留三个功能：实时听写、热词替换、音视频文件转录。长按 CapsLock 或鼠标 X2 超过 0.3 秒开始听写，松开后输入；短按补发原键。托盘提供热词编辑、文件转录、缺少模型时一键下载及退出。文件输出 TXT、JSON、SRT，默认保留已有同名输出。
+
+> **从零复现与模型/运行库获取**：本仓库不提交大体积模型权重与原生二进制，但提供**内置模型下载校验器**（`语音输入.exe download-models`）与完整的固定校验清单。如从空环境或灾备场景重建全部运行库（llama.cpp b9090 + 全部 4 个补丁、ONNX Runtime 1.24.4、PortAudio、FFmpeg）与模型权重（含上游预转换包直链及从 Hugging Face 原始权重自行导出的兜底路径），请直接阅读 [**从零完整复现手册**](docs/reproduce.md)。
 
 本项目参考并移植了 [CapsWriter-Offline](https://github.com/HaujetZhao/CapsWriter-Offline) 的应用行为、热词、格式化、合并和字幕算法，保留原作者 **Haujet Zhao** 的 MIT 版权及第三方声明。这是独立的 Rust 重构仓库，不是上游的 GitHub Fork。
+
+## 0.6.0-p2（基于 0.6.0）
+
+- **内置模型下载校验与外置权重转换**：缺少当前模型时，托盘菜单提供“下载模型”，命令行支持 `语音输入.exe download-models`（加 `--all` 可同时下载 0.6B 与 1.7B），支持断点续传、系统/环境变量代理、`model_mirror_base` 镜像前缀、SHA256 校验、自动生成 `.weights.bin` 外置权重并自动清理临时压缩包。
+- **可选 Silero VAD 与可选解码器预热**：默认关闭 `vad` 和 `asr_warmup`，保持与 0.6.0 一致的冷启动耗时与加载私有提交内存（零性能/内存退步）。开启 `vad` 后在推理 worker 子进程内以零拷贝张量视图运行，无语音片段直接丢弃且不唤醒 ASR 大模型，120 秒闲置后随 worker 一并卸载；开启 `asr_warmup` 时仅在桌面听写显式预热且位于 `EmptyWorkingSet` 之前执行，可缩短长按松手后的首句等待。
+- **稳定性与安全加固**：下载、哈希校验与大文件解压缓冲均使用堆内存，消除 Windows 主线程 1 MiB 栈溢出风险；严格校验 HTTP `206` 的 `Content-Range` 起始偏移、`200` 的 `Content-Length` 与协议相对重定向；解压与重试等待及时响应取消，托盘退出时干净汇合后台下载线程。
+- **完整灾备复现手册**：新增 [从零完整复现手册](docs/reproduce.md)，集中固定全部 4 个模型包的 URL / 字节数 / SHA256、上游导出脚本仓库、llama.cpp b9090 全部 4 个补丁一站式构建参数及 ONNX Runtime / PortAudio / FFmpeg 精确依赖规格。
 
 ## 0.6.0
 
@@ -80,16 +89,16 @@ Copy-Item '.\assets\text\rules_default.txt' '.\dist\app\config\hot-rule.txt'
 
 缺少当前 ASR 或对齐器时，托盘弹出提示，菜单出现“下载模型”。程序按内置目录断点续传（自动支持 `HTTPS_PROXY`/`HTTP_PROXY` 环境变量及 Windows 系统代理，拒绝 HTTPS 降级重定向）、校验 SHA256、解压，再生成与 `tools/models/prepare_external_weights.py` 相同规则的 `.weights.bin`，验证完成后自动清理临时压缩包与解压缓存。已经校验通过的文件会跳过。启动时只检查文件是否存在且非空；要重新校验请再执行下载。
 
-大陆网络也可在 `settings.json` 设置 `model_mirror_base`，例如 `https://你的镜像`。实际请求地址是镜像前缀接上目录中的完整 URL。`model_download_retries` 默认 3。旧配置没有这些字段时仍能启动：预热默认开启，VAD 默认关闭。
+大陆网络也可在 `settings.json` 设置 `model_mirror_base`，例如 `https://你的镜像`。实际请求地址是镜像前缀接上目录中的完整 URL。`model_download_retries` 默认 3。旧配置没有这些字段时仍能启动：`asr_warmup` 与 `vad` 均默认关闭，避免引入额外加载开销。
 
 ```powershell
 .\dist\app\语音输入.exe download-models
 .\dist\app\语音输入.exe download-models --all
 ```
 
-0.6B 与对齐器来自 [HaujetZhao/Qwen3-ASR-GGUF](https://github.com/HaujetZhao/Qwen3-ASR-GGUF/releases/tag/models) 的 `Qwen3-ASR-0.6B-gguf.zip`、`Qwen3-ForceAligner-0.6B-gguf.zip`。1.7B 仍是原来的 FP16 ONNX 与 Q5_K_M GGUF，对应 [CapsWriter-Offline](https://github.com/HaujetZhao/CapsWriter-Offline/releases/tag/models) 的 `Qwen3-ASR-1.7B-q5_k.zip`。GGUF 仓库里的 `Qwen3-ASR-1.7B-gguf.zip` 是另一套 INT4/Q4_K 文件名，不能放进当前 1.7B 目录。
+0.6B 与对齐器来自 [HaujetZhao/Qwen3-ASR-GGUF](https://github.com/HaujetZhao/Qwen3-ASR-GGUF/releases/tag/models) 的 `Qwen3-ASR-0.6B-gguf.zip`、`Qwen3-ForceAligner-0.6B-gguf.zip`。1.7B 仍是原来的 FP16 ONNX 与 Q5_K_M GGUF，对应 [CapsWriter-Offline](https://github.com/HaujetZhao/CapsWriter-Offline/releases/tag/models) 的 `Qwen3-ASR-1.7B-q5_k.zip`。GGUF 仓库里的 `Qwen3-ASR-1.7B-gguf.zip` 是另一套 INT4/Q4_K 文件名，不能放进当前 1.7B 目录。每个压缩包和内部成员的精确字节数、SHA256，以及从 Hugging Face 原始权重自行导出的兜底流程与原生 `runtime/` 完整重建命令均汇总于 [从零完整复现手册](docs/reproduce.md)。
 
-`asr_warmup` 默认开启：仅在桌面听写按住触发显式 `warmup` 加载 ASR 时，于 `trim_after_load` 裁剪工作集之前用 1 秒静音预热解码器（不拖慢冷启动文件转录，不破坏工作集裁剪），不读热词、不带上下文，结束时清理解码状态。`vad` 默认关闭。打开后在推理 worker 子进程内运行 Silero VAD（托盘主进程不加载 ONNX Runtime，随 120 秒闲置与 worker 一并完全卸载），且仅在检测到足够语音时才加载 ASR 进行识别；无语音片段直接丢弃，有语音则裁掉首尾静音。阈值、最短语音和两端保留分别是 `vad_threshold`、`vad_min_speech_ms`、`vad_speech_pad_ms`。VAD 模型是 Silero 官方 `silero_vad.onnx`（约 2.1 MiB），放在 `models/silero/`。
+`asr_warmup` 默认关闭（可按需设为 `true`）：开启后仅在桌面听写按住触发显式 `warmup` 加载 ASR 时，于 `trim_after_load` 裁剪工作集之前用 1 秒静音预热解码器（不拖慢冷启动文件转录，不破坏工作集裁剪），不读热词、不带上下文，结束时清理解码状态。`vad` 默认关闭。打开后在推理 worker 子进程内运行 Silero VAD（托盘主进程不加载 ONNX Runtime，随 120 秒闲置与 worker 一并完全卸载），且仅在检测到足够语音时才加载 ASR 进行识别；无语音片段直接丢弃，有语音则裁掉首尾静音。阈值、最短语音和两端保留分别是 `vad_threshold`、`vad_min_speech_ms`、`vad_speech_pad_ms`。VAD 模型是 Silero 官方 `silero_vad.onnx`（约 2.1 MiB），放在 `models/silero/`。
 
 ## 可选 ASR 模型
 
@@ -219,6 +228,10 @@ Vulkan 缓存另有每模式三轮对照：保留系统及驱动缓存，每轮�
 进程树峰值来自目标 25ms 间隔采样，包含加载，仍是瞬时峰值的观测下界，排除桌面进程、GPU 专用内存及驱动。末短提交只对应本组最后一个短请求。文件性能组验证的是独立 PCM 请求；指定混合模式与导出检查也不覆盖所有流式分段边界、媒体文件或第三方窗口组合。
 
 发布树使用通用合成热词、格式化、合并、字幕和数值参考，不包含私人录音、个人热词或本机测量资料。完整设备/模型烟测默认忽略，普通测试不启动模型或操作设备。
+
+## 致谢
+
+感谢 [CapsWriter-Offline](https://github.com/HaujetZhao/CapsWriter-Offline)（Haujet Zhao）、[Qwen3-ASR-GGUF](https://github.com/HaujetZhao/Qwen3-ASR-GGUF) 及上游推理引擎社区。本项目的架构重构、性能验证、模型下载校验与灾备复现文档由 **Gemini** 与 **GPT** 协助开发。
 
 ## 许可证
 

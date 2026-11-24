@@ -4,6 +4,8 @@
 
 进一步的模型加载优化见 [Windows Vulkan 有界模型上传](windows-vulkan-bounded-upload.md)：GPU 权重使用原有小缓冲环上传，CPU 嵌入表继续零拷贝映射，不改变模型计算。
 
+> **无旧目录时的一站式全量重建**：如果需要从零构建包含全部 4 个补丁（`aligner-logits.patch` → `ggml-vulkan-cache.patch` → `asr-single-output.patch` → `windows-vulkan-bounded-upload.patch`）以及 `ggml.dll`、`ggml-base.dll`、`ggml-cpu-*.dll`、`ggml-vulkan.dll`、`llama.dll` 的完整 `runtime/llama/`，请直接按 [从零完整复现手册](../docs/reproduce.md#41-runtimellamallamacpp-b9090--4-个补丁一站式构建) 执行。下文保留历史分步构建说明。
+
 `aligner-logits.patch` 针对官方 [llama.cpp](https://github.com/ggml-org/llama.cpp) 的 **b9090**，提交 **`5757c4dcb178a01c85234a6db7503b19c9598873`**。它为只读、CPU Qwen3VL 文件对齐增加两个导出函数：`caps_llama_init_from_model_with_logits_limit` 和 `caps_llama_logits_width`。普通初始化入口继续输出完整词表；GPU 路线由应用配置显式选择。
 
 `ggml-vulkan-cache.patch` 使用同一提交，为 Windows Vulkan 后端添加持久管线缓存及缓存失效后的无缓存重试，并将构建期 shader 编译器内部并发上限设为 2。补丁本身已经包含新增 `ggml-vulkan-cache.hpp`；仓库内的同名头文件用于独立审阅，不必再次手动复制。

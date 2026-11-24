@@ -429,6 +429,7 @@ pub fn desktop(settings: Settings, seed: Option<u32>, passive: bool) -> Result<(
         .name("desktop-dispatch".into())
         .spawn(move || {
             let mut session: Option<MicSession> = None;
+            let mut download_thread: Option<thread::JoinHandle<()>> = None;
             while let Ok(event) = events_rx.recv() {
                 let quitting = matches!(event, DesktopEvent::Quit);
                 let voice_event = matches!(
@@ -482,10 +483,13 @@ pub fn desktop(settings: Settings, seed: Option<u32>, passive: bool) -> Result<(
                             }
                         }
                         DesktopEvent::DownloadModels => {
+                            if let Some(handle) = download_thread.take() {
+                                let _ = handle.join();
+                            }
                             let settings = dispatch_client.settings.clone();
                             let cancel = std::sync::Arc::clone(&download_cancel);
                             let output = dispatch_output.clone();
-                            thread::spawn(move || {
+                            download_thread = Some(thread::spawn(move || {
                                 let progress = |message: &str| {
                                     let _ = output.send(DesktopOutput::State(message.to_owned()));
                                 };
@@ -497,7 +501,7 @@ pub fn desktop(settings: Settings, seed: Option<u32>, passive: bool) -> Result<(
                                 };
                                 let _ =
                                     output.send(DesktopOutput::DownloadFinished { ok, message });
-                            });
+                            }));
                         }
                         DesktopEvent::Transcribe(file) => {
                             files_tx.try_send(file).map_err(|_| {
@@ -526,6 +530,9 @@ pub fn desktop(settings: Settings, seed: Option<u32>, passive: bool) -> Result<(
                 if quitting {
                     break;
                 }
+            }
+            if let Some(handle) = download_thread.take() {
+                let _ = handle.join();
             }
             drop(files_tx);
             let _ = file_thread.join();

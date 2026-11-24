@@ -32,7 +32,7 @@
   "aligner_logits_limit": 4000,
   "file_context_handoff": true,
   "vulkan_pipeline_cache": true,
-  "asr_warmup": true,
+  "asr_warmup": false,
   "vad": false,
   "vad_threshold": 0.5,
   "vad_min_speech_ms": 250,

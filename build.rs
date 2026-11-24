@@ -13,12 +13,20 @@ fn main() {
     }
 
     let version = env::var("CARGO_PKG_VERSION").expect("package version");
-    let mut numbers: Vec<_> = version
-        .split(['.', '-'])
+    let (core, pre) = version
+        .split_once('-')
+        .map_or((version.as_str(), None), |(c, p)| (c, Some(p)));
+    let mut numbers: Vec<u16> = core
+        .split('.')
         .take(3)
         .map(|part| part.parse::<u16>().expect("numeric package version"))
         .collect();
-    numbers.resize(4, 0);
+    numbers.resize(3, 0);
+    let patch_revision = pre
+        .and_then(|suffix| suffix.strip_prefix('p'))
+        .and_then(|digits| digits.parse::<u16>().ok())
+        .unwrap_or(0);
+    numbers.push(patch_revision);
     let numeric_version = numbers
         .iter()
         .map(u16::to_string)
