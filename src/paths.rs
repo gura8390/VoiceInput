@@ -52,6 +52,15 @@ impl<'a> AppPaths<'a> {
     }
 
     pub fn aligner_model(self) -> PathBuf {
-        self.root.join("models/Qwen3-ForcedAligner/Qwen3-ForcedAligner-0.6B")
+        self.root
+            .join("models/Qwen3-ForcedAligner/Qwen3-ForcedAligner-0.6B")
+    }
+
+    pub fn vad_model(self) -> PathBuf {
+        self.root.join("models/silero/silero_vad.onnx")
+    }
+
+    pub fn downloads(self) -> PathBuf {
+        self.root.join("cache/downloads")
     }
 }

@@ -5,7 +5,7 @@ use std::{
     path::PathBuf,
     sync::{
         Arc,
-        atomic::{AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
         mpsc::{self, Receiver},
     },
     time::{Duration, Instant},
@@ -23,6 +23,7 @@ pub enum DesktopEvent {
     CaptureFailed(String),
     Stop,
     Transcribe(PathBuf),
+    DownloadModels,
     Quit,
 }
 
@@ -32,6 +33,11 @@ pub enum DesktopOutput {
     Text(String),
     State(String),
     Error(String),
+    /// The model download finished. `ok` clears the missing-model menu entry.
+    DownloadFinished {
+        ok: bool,
+        message: String,
+    },
 }
 
 #[derive(Debug)]
@@ -160,6 +166,8 @@ pub struct DesktopOptions {
     pub enable_hooks: bool,
     pub enable_capture: bool,
     pub restore_clipboard: bool,
+    pub models_missing: bool,
+    pub cancel_download: Arc<AtomicBool>,
 }
 
 impl DesktopOptions {
@@ -172,6 +180,8 @@ impl DesktopOptions {
             enable_hooks: true,
             enable_capture: true,
             restore_clipboard: true,
+            models_missing: false,
+            cancel_download: Arc::new(AtomicBool::new(false)),
         }
     }
 }

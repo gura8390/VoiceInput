@@ -25,6 +25,10 @@ use std::{
     time::{Instant, SystemTime, UNIX_EPOCH},
 };
 
+pub(crate) fn ensure_onnx_runtime(path: &Path) -> Result<()> {
+    encoder::init_ort(path)
+}
+
 /// Opt-in diagnostics use stderr so the binary protocol remains unchanged.
 pub(super) fn load_timing(stage: &'static str, started: Instant) {
     if std::env::var_os("YYUR_PROFILE_LOAD").is_some() {
@@ -312,6 +316,50 @@ impl Engine {
     /// Native sampler seeds, one for each possible repetition-recovery attempt.
     pub fn set_native_seeds(&mut self, seeds: &[u32]) {
         self.next_seeds = seeds.iter().copied().collect();
+    }
+
+    /// Exercise the encoder and one decoder step with silence.
+    /// No hotwords or caller context are applied. Decoder state is cleared before return,
+    /// and sampler seeds are left untouched.
+    pub fn warmup_pipelines(&mut self) -> Result<()> {
+        let silence = vec![0.0f32; 32_000];
+        let feature = self.encoder.encode(&silence)?;
+        ensure!(
+            feature.dim == self.model.dim,
+            "ASR encoder dimension mismatch"
+        );
+        let mut pre = vec![self.special[0]];
+        pre.extend(
+            self.model
+                .tokenize("system\nYou are a helpful assistant.")?,
+        );
+        pre.push(self.special[1]);
+        pre.push(self.special[0]);
+        pre.extend(self.model.tokenize("user\n")?);
+        pre.push(self.special[2]);
+        let mut post = vec![self.special[3], self.special[1], self.special[0]];
+        post.extend(self.model.tokenize("assistant\n")?);
+        post.push(self.special[4]);
+        let mut full = self.embeddings.rows(&pre)?;
+        full.extend_from_slice(&feature.data);
+        full.extend(self.embeddings.rows(&post)?);
+        let n = full.len() / self.model.dim;
+        self.ensure_context(n)?;
+        let decoded = (|| -> Result<()> {
+            let ctx = self
+                .ctx
+                .as_mut()
+                .context("ASR context was not initialized")?;
+            ctx.clear()?;
+            ctx.prefill(&full, n, self.model.dim, &[])?;
+            let _ = ctx.decode_token(self.model.eos)?;
+            Ok(())
+        })();
+        if let Some(ctx) = self.ctx.as_mut() {
+            let _ = ctx.clear();
+        }
+        drop(full);
+        decoded
     }
 
     /// Release decoder state while retaining model weights and the encoder.

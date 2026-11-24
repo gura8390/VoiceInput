@@ -87,6 +87,15 @@ impl Pipeline {
                     );
                 }
             }
+            if self.settings.asr_warmup
+                && let Some(engine) = self.engine.as_mut()
+            {
+                // Silence only: no hotwords, no caller context. A failure here must
+                // not block the real request; the context is cleared inside warmup.
+                if let Err(error) = engine.warmup_pipelines() {
+                    eprintln!("ASR 预热未完成，继续等待正式听写：{error:#}");
+                }
+            }
         }
         Ok(())
     }

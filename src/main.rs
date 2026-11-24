@@ -7,14 +7,13 @@ use yuybuuru::{
     application, automation,
     config::{AsrModel, Settings},
     engine::{Engine, EngineOptions},
-    media, paths::AppPaths, worker,
+    media,
+    paths::AppPaths,
+    worker,
 };
 
 #[derive(Parser)]
-#[command(
-    version,
-    about = "本机离线听写、热词修正与音视频转录"
-)]
+#[command(version, about = "本机离线听写、热词修正与音视频转录")]
 struct Cli {
     #[arg(long, global = true)]
     app_dir: Option<PathBuf>,
@@ -57,6 +56,12 @@ enum Mode {
     Worker {
         #[arg(long)]
         settings_json: String,
+    },
+    /// 下载、校验并准备语音模型，已通过校验的文件会跳过。
+    DownloadModels {
+        /// 同时下载另一档 ASR。默认只准备当前配置选用的型号、对齐器和 VAD。
+        #[arg(long)]
+        all: bool,
     },
     /// Offline native diagnostic, bypassing the desktop and input hooks.
     Infer {
@@ -142,14 +147,14 @@ fn write_json(value: &serde_json::Value) -> Result<()> {
 }
 fn run(cli: Cli) -> Result<()> {
     if let Some(Mode::Automation { command }) = &cli.command {
-        let config = cli
-            .config
-            .clone()
-            .unwrap_or(
-                AppPaths::new(
-                    std::env::current_exe()?.parent().context("Executable directory")?,
-                ).settings(),
-            );
+        let config = cli.config.clone().unwrap_or(
+            AppPaths::new(
+                std::env::current_exe()?
+                    .parent()
+                    .context("Executable directory")?,
+            )
+            .settings(),
+        );
         let config = if config.is_absolute() {
             config
         } else {
@@ -177,6 +182,15 @@ fn run(cli: Cli) -> Result<()> {
         Mode::Automation { .. } => unreachable!(),
         Mode::Desktop { passive } => application::desktop(settings, cli.seed, passive),
         Mode::Serve => worker::serve(settings),
+        Mode::DownloadModels { all } => {
+            let cancel = std::sync::atomic::AtomicBool::new(false);
+            let summary =
+                yuybuuru::models::install_selected(&settings, all, &cancel, &|message| {
+                    println!("{message}")
+                })?;
+            println!("{summary}");
+            Ok(())
+        }
         Mode::Worker { .. } => unreachable!(),
         Mode::Transcribe {
             files,

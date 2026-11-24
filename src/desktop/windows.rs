@@ -40,6 +40,7 @@ const TIMER_SHUTDOWN: usize = 3;
 const COMMAND_TRANSCRIBE: u32 = 1;
 const COMMAND_HOTWORDS: u32 = 2;
 const COMMAND_QUIT: u32 = 3;
+const COMMAND_DOWNLOAD: u32 = 4;
 
 thread_local! { static HOOK_CONTEXT: Cell<*const Context> = const { Cell::new(ptr::null()) }; }
 
@@ -77,15 +78,25 @@ fn wide_path(value: &std::path::Path) -> Vec<u16> {
     value.as_os_str().encode_wide().chain(Some(0)).collect()
 }
 fn tip(value: &str) -> [u16; 128] {
-    let mut units: Vec<_> = value.encode_utf16().take(127).collect();
-    if units
-        .last()
-        .is_some_and(|unit| (0xd800..=0xdbff).contains(unit))
-    {
-        units.pop();
+    fill_wide(value)
+}
+
+fn fill_wide<const N: usize>(value: &str) -> [u16; N] {
+    let mut output = [0u16; N];
+    if N == 0 {
+        return output;
     }
-    let mut output = [0u16; 128];
-    output[..units.len()].copy_from_slice(&units);
+    let mut length = 0;
+    for unit in value.encode_utf16() {
+        if length + 1 >= N {
+            break;
+        }
+        output[length] = unit;
+        length += 1;
+    }
+    if length > 0 && (0xd800..=0xdbff).contains(&output[length - 1]) {
+        output[length - 1] = 0;
+    }
     output
 }
 
@@ -133,6 +144,9 @@ struct Context {
     closing: Cell<bool>,
     alive: Arc<AtomicBool>,
     busy: Arc<AtomicBool>,
+    models_missing: Cell<bool>,
+    model_notice_shown: Cell<bool>,
+    downloading: Arc<AtomicBool>,
 }
 
 impl Context {
@@ -156,7 +170,22 @@ impl Context {
         self.added.set(true);
         data.Anonymous.uVersion = NOTIFYICON_VERSION_4;
         Shell_NotifyIconW(NIM_SETVERSION, &mut data);
+        self.show_model_notice();
         true
+    }
+
+    unsafe fn show_model_notice(&self) {
+        if !self.models_missing.get() || !self.added.get() || self.model_notice_shown.get() {
+            return;
+        }
+        let mut data = self.notification();
+        data.uFlags |= NIF_INFO;
+        data.szInfoTitle = fill_wide("语音输入");
+        data.szInfo = fill_wide("缺少语音模型。请在托盘菜单选择“下载模型”。");
+        data.dwInfoFlags = NIIF_INFO;
+        if Shell_NotifyIconW(NIM_MODIFY, &mut data) != 0 {
+            self.model_notice_shown.set(true);
+        }
     }
 
     unsafe fn set_status(&self, value: String) {
@@ -212,6 +241,7 @@ impl Context {
             return;
         }
         self.alive.store(false, Ordering::Release);
+        self.options.cancel_download.store(true, Ordering::Release);
         self.capture.cancel_press();
         let _ = self.events.send(DesktopEvent::Quit);
         KillTimer(self.hwnd.get(), TIMER_HOLD);
@@ -253,11 +283,25 @@ impl Context {
         }
     }
 
+    unsafe fn start_download(&self) {
+        if self.downloading.swap(true, Ordering::AcqRel) {
+            self.set_status("正在下载模型".into());
+            return;
+        }
+        self.options.cancel_download.store(false, Ordering::Release);
+        self.set_status("正在下载模型".into());
+        if self.events.send(DesktopEvent::DownloadModels).is_err() {
+            self.downloading.store(false, Ordering::Release);
+            self.set_status("无法开始下载模型".into());
+        }
+    }
+
     unsafe fn edit_hotwords(&self) {
         let file = crate::paths::AppPaths::new(&self.options.base_dir).hotwords();
         if !file.exists() {
             if let Err(error) = std::fs::create_dir_all(file.parent().expect("Hotword directory"))
-                .and_then(|_| std::fs::write(&file, b"")) {
+                .and_then(|_| std::fs::write(&file, b""))
+            {
                 self.set_status(error.to_string());
                 return;
             }
@@ -285,11 +329,16 @@ impl Context {
         let state = wide(&self.status.borrow());
         AppendMenuW(menu, MF_STRING | MF_GRAYED, 0, state.as_ptr());
         AppendMenuW(menu, MF_SEPARATOR, 0, ptr::null());
-        for (id, label) in [
+        let mut entries = Vec::new();
+        if self.models_missing.get() {
+            entries.push((COMMAND_DOWNLOAD, "下载模型"));
+        }
+        entries.extend([
             (COMMAND_TRANSCRIBE, "转录音频 / 视频…"),
             (COMMAND_HOTWORDS, "编辑热词"),
             (COMMAND_QUIT, "退出"),
-        ] {
+        ]);
+        for (id, label) in entries {
             let text = wide(label);
             AppendMenuW(menu, MF_STRING, id as usize, text.as_ptr());
         }
@@ -307,6 +356,7 @@ impl Context {
         PostMessageW(self.hwnd.get(), WM_NULL, 0, 0);
         DestroyMenu(menu);
         match command {
+            COMMAND_DOWNLOAD => self.start_download(),
             COMMAND_TRANSCRIBE => self.choose_file(),
             COMMAND_HOTWORDS => self.edit_hotwords(),
             COMMAND_QUIT => self.start_shutdown(),
@@ -435,6 +485,13 @@ unsafe fn dispatch(
             match *output {
                 DesktopOutput::State(text) | DesktopOutput::Error(text) => context.set_status(text),
                 DesktopOutput::Text(_) => {}
+                DesktopOutput::DownloadFinished { ok, message } => {
+                    context.downloading.store(false, Ordering::Release);
+                    if ok {
+                        context.models_missing.set(false);
+                    }
+                    context.set_status(message);
+                }
             }
             Some(0)
         }
@@ -506,6 +563,7 @@ pub(super) fn run(
         let taskbar_created = RegisterWindowMessageW(wide("TaskbarCreated").as_ptr());
         let alive = Arc::new(AtomicBool::new(true));
         let busy = Arc::new(AtomicBool::new(false));
+        let models_missing = options.models_missing;
         let context = Box::new(Context {
             options,
             events,
@@ -513,13 +571,20 @@ pub(super) fn run(
             holds: RefCell::default(),
             hwnd: Cell::new(ptr::null_mut()),
             icons,
-            status: RefCell::new("待命".into()),
+            status: RefCell::new(if models_missing {
+                "缺少语音模型".to_owned()
+            } else {
+                "待命".to_owned()
+            }),
             taskbar_created,
             added: Cell::new(false),
             retries: Cell::new(0),
             closing: Cell::new(false),
             alive: Arc::clone(&alive),
             busy: Arc::clone(&busy),
+            models_missing: Cell::new(models_missing),
+            model_notice_shown: Cell::new(false),
+            downloading: Arc::new(AtomicBool::new(false)),
         });
         let hwnd = CreateWindowExW(
             0,

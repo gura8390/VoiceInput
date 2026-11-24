@@ -45,6 +45,8 @@ python tools/models/prepare_external_weights.py --source 输入目录/encoder.on
 
 转换必须显式指定 `--output-root`，源目录与输出树相互分离。工具拒绝覆盖任何既有 ONNX、sidecar 或收据，拒绝父目录穿越、符号链接和目录联接等重解析路径。输出分别为原文件名的 ONNX、同前缀 `.weights.bin` 及 `.external.json` 收据。中途失败时不会生成成功收据；已经创建的部分输出保留供检查，下一次转换需使用新输出位置。
 
+程序内的“下载模型”使用同一套字节规则在 Rust 中生成 sidecar，不调用 Python，也不创建 ONNX Runtime 会话。日常安装可以只用程序；这个脚本仍用于开发和对照。
+
 收据逐 tensor 记录 dtype、维度、payload SHA256，并核对其余模型字段、节点、属性和原始文件前后身份。工具不假定固定 tensor 数量，可用于 ASR 前后端及文件对齐器。量化权重、scale 和零点按原始序列化字节保留。执行输出与资源变化由独立编码和完整转写对照记录。
 
 `validation/test_external_weights.py` 覆盖合成权重转换、输入缺失、输出碰撞、源目录交叉、路径边界、重解析点和并发独占写入。

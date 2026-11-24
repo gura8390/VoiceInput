@@ -108,6 +108,16 @@ pub struct Settings {
     pub format_spell: bool,
     pub segment_seconds: usize,
     pub overlap_seconds: usize,
+    /// Run one silent encoder+decoder pass after each ASR load. Default on.
+    pub asr_warmup: bool,
+    /// Drop no-speech clips and trim silence after hold-to-dictate. Default off.
+    pub vad: bool,
+    pub vad_threshold: f64,
+    pub vad_min_speech_ms: u64,
+    pub vad_speech_pad_ms: u64,
+    /// Optional prefix such as `https://mirror.example`. Empty uses the catalog URL.
+    pub model_mirror_base: String,
+    pub model_download_retries: u32,
 }
 impl Default for Settings {
     fn default() -> Self {
@@ -154,8 +164,49 @@ impl Default for Settings {
             format_spell: true,
             segment_seconds: 60,
             overlap_seconds: 4,
+            asr_warmup: true,
+            vad: false,
+            vad_threshold: 0.5,
+            vad_min_speech_ms: 250,
+            vad_speech_pad_ms: 30,
+            model_mirror_base: String::new(),
+            model_download_retries: 3,
         }
     }
+}
+
+pub(crate) fn validate_model_mirror(value: &str) -> Result<()> {
+    let value = value.trim();
+    if value.is_empty() {
+        return Ok(());
+    }
+    ensure!(value.len() <= 200, "模型镜像地址过长");
+    ensure!(
+        value.starts_with("https://") || value.starts_with("http://"),
+        "模型镜像只接受 http 或 https"
+    );
+    ensure!(
+        !value.contains('@')
+            && !value.contains('\\')
+            && !value.contains(' ')
+            && !value.contains(".."),
+        "模型镜像地址无效"
+    );
+    let host = value.split_once("://").map(|(_, rest)| rest).unwrap_or("");
+    ensure!(
+        !host.is_empty() && !host.starts_with('/'),
+        "模型镜像缺少主机名"
+    );
+    Ok(())
+}
+
+pub(crate) fn resolve_model_url(catalog_url: &str, mirror_base: &str) -> Result<String> {
+    validate_model_mirror(mirror_base)?;
+    let mirror = mirror_base.trim().trim_end_matches('/');
+    if mirror.is_empty() {
+        return Ok(catalog_url.to_owned());
+    }
+    Ok(format!("{mirror}/{catalog_url}"))
 }
 impl Settings {
     pub fn load(path: Option<&Path>, app_override: Option<&Path>) -> Result<Self> {
@@ -205,6 +256,23 @@ impl Settings {
             value.encoder_frontend_threads,
             value.encoder_dynamic_block_base,
         )?;
+        ensure!(
+            (0.0..=1.0).contains(&value.vad_threshold),
+            "VAD threshold must be between 0 and 1"
+        );
+        ensure!(
+            value.vad_min_speech_ms <= 10_000,
+            "VAD minimum speech must be at most 10000 ms"
+        );
+        ensure!(
+            value.vad_speech_pad_ms <= 2_000,
+            "VAD speech padding must be at most 2000 ms"
+        );
+        ensure!(
+            value.model_download_retries <= 8,
+            "Model download retries must be at most 8"
+        );
+        validate_model_mirror(&value.model_mirror_base)?;
         Ok(value)
     }
 }
@@ -325,6 +393,64 @@ mod tests {
             assert_eq!(settings.encoder_provider, expected);
         }
         assert!(serde_json::from_str::<Settings>(r#"{"encoder_provider":"cuda"}"#).is_err());
+    }
+
+    #[test]
+    fn old_settings_keep_warmup_on_and_vad_off() {
+        let old: Settings = serde_json::from_str("{}").unwrap();
+        assert!(old.asr_warmup);
+        assert!(!old.vad);
+        assert_eq!(old.vad_threshold, 0.5);
+        assert_eq!(old.vad_min_speech_ms, 250);
+        assert_eq!(old.vad_speech_pad_ms, 30);
+        assert!(old.model_mirror_base.is_empty());
+        assert_eq!(old.model_download_retries, 3);
+        let configured: Settings = serde_json::from_str(
+            r#"{"asr_warmup":false,"vad":true,"vad_threshold":0.6,"vad_min_speech_ms":400,"vad_speech_pad_ms":60,"model_mirror_base":"https://mirror.example/github","model_download_retries":2}"#,
+        )
+        .unwrap();
+        assert!(!configured.asr_warmup);
+        assert!(configured.vad);
+        assert_eq!(configured.vad_threshold, 0.6);
+        assert_eq!(configured.vad_min_speech_ms, 400);
+        assert_eq!(configured.model_download_retries, 2);
+        let roundtrip: Settings =
+            serde_json::from_value(serde_json::to_value(&configured).unwrap()).unwrap();
+        assert_eq!(roundtrip.model_mirror_base, configured.model_mirror_base);
+        assert!(!roundtrip.asr_warmup);
+        assert!(resolve_model_url(
+            "https://github.com/HaujetZhao/Qwen3-ASR-GGUF/releases/download/models/Qwen3-ASR-0.6B-gguf.zip",
+            &configured.model_mirror_base
+        )
+        .unwrap()
+        .starts_with("https://mirror.example/github/https://github.com/"));
+        assert!(
+            resolve_model_url("https://example.invalid/model", "")
+                .unwrap()
+                .starts_with("https://")
+        );
+        let directory =
+            std::env::temp_dir().join(format!("yyur-settings-{}-{}", std::process::id(), line!()));
+        let _ = std::fs::remove_dir_all(&directory);
+        std::fs::create_dir_all(&directory).unwrap();
+        for invalid in [
+            r#"{"model_mirror_base":"ftp://mirror.example"}"#,
+            r#"{"model_mirror_base":"https://user@mirror.example"}"#,
+            r#"{"model_mirror_base":"http://"}"#,
+            r#"{"model_mirror_base":"https://mirror.example/../secret"}"#,
+            r#"{"vad_threshold":1.5}"#,
+            r#"{"model_download_retries":9}"#,
+            r#"{"vad_min_speech_ms":10001}"#,
+        ] {
+            let path = directory.join("settings.json");
+            std::fs::write(&path, invalid).unwrap();
+            assert!(Settings::load(Some(&path), None).is_err(), "{invalid}");
+        }
+        let path = directory.join("settings.json");
+        std::fs::write(&path, "{}").unwrap();
+        let loaded = Settings::load(Some(&path), None).unwrap();
+        assert!(loaded.asr_warmup && !loaded.vad);
+        let _ = std::fs::remove_dir_all(&directory);
     }
 
     #[test]

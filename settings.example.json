@@ -31,5 +31,12 @@
   "aligner_dynamic_context": true,
   "aligner_logits_limit": 4000,
   "file_context_handoff": true,
-  "vulkan_pipeline_cache": true
+  "vulkan_pipeline_cache": true,
+  "asr_warmup": true,
+  "vad": false,
+  "vad_threshold": 0.5,
+  "vad_min_speech_ms": 250,
+  "vad_speech_pad_ms": 30,
+  "model_mirror_base": "",
+  "model_download_retries": 3
 }
