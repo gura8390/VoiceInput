@@ -1,4 +1,4 @@
-# 语音输入 · YuYbUuRu
+# 语音输入 · VoiceInput
 
 Windows x64 离线语音输入工具，当前版本 **0.6.0-p2**（Windows 文件版本 `0.6.0.2`）。启动文件统一为 **语音输入.exe**，应用图标与中文产品信息嵌入程序。正式安装和示例配置默认使用 Qwen3-ASR-1.7B，0.6B 可选。沿用 Vulkan 解码、CPU 编码器、ASR 单输出预留和固定形状前端缓冲复用。应用层使用 Rust，日常运行无需 Python；推理使用 ONNX Runtime 和 llama.cpp 原生库。
 
@@ -155,7 +155,7 @@ Copy-Item '.\assets\text\rules_default.txt' '.\dist\app\config\hot-rule.txt'
 
 ## 上一轮 CUDA 技术路线对照
 
-独立 [0.4.3—CUDA 技术分支](https://github.com/gura8390/YuYbUuRu/tree/0.4.3%E2%80%94CUDA) 已归档，参见 [CUDA 技术路线归档报告](docs/history/cuda-route-archive.md)。本节数据来自该轮，尚未启用 0.4.4 前端 arena。当前主线默认 `gpu_backend=vulkan`，按名字选择 `Vulkan0`。可显式选择 `cuda` / `CUDA0`，但需另外准备匹配 b9090 的 CUDA 插件、CUDA 12.8 运行库和 cuBLAS/Lt；缺少设备或后端明确报错。
+独立 0.4.3—CUDA 技术分支 已归档，参见 [CUDA 技术路线归档报告](docs/history/cuda-route-archive.md)。本节数据来自该轮，尚未启用 0.4.4 前端 arena。当前主线默认 `gpu_backend=vulkan`，按名字选择 `Vulkan0`。可显式选择 `cuda` / `CUDA0`，但需另外准备匹配 b9090 的 CUDA 插件、CUDA 12.8 运行库和 cuBLAS/Lt；缺少设备或后端明确报错。
 
 采用以下配置：
 
